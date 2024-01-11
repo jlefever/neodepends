@@ -1,0 +1,3 @@
+[submodule "thirdparty/stack-graphs"]
+	path = thirdparty/stack-graphs
+	url = https://github.com/github/stack-graphs/
