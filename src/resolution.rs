@@ -8,7 +8,6 @@ use stack_graphs::stitching::DatabaseCandidates;
 use stack_graphs::stitching::ForwardPartialPathStitcher;
 use stack_graphs::stitching::StitcherConfig;
 use tree_sitter_graph::Variables;
-use tree_sitter_stack_graphs::loader::LanguageConfiguration;
 use tree_sitter_stack_graphs::NoCancellation;
 
 static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
@@ -42,6 +41,38 @@ impl ResolutionCtx {
             &mut graph,
             file,
             source,
+            &Variables::new(),
+            &NoCancellation,
+        )?;
+
+        ForwardPartialPathStitcher::find_minimal_partial_path_set_in_file(
+            &graph,
+            &mut partials,
+            file,
+            StitcherConfig::default(),
+            &stack_graphs::NoCancellation,
+            |_, _, p| {
+                paths.push(p.clone());
+            },
+        )?;
+
+        Ok(Self::new(graph, partials, paths))
+    }
+
+    pub fn dummy(filename: &str) -> Result<Self> {
+        let mut graph = StackGraph::new();
+        let mut partials = PartialPaths::new();
+        let mut paths = Vec::new();
+
+        let file = graph.get_or_create_file(filename);
+
+        // TODO: Select the config using Loader from tree_sitter_stack_graphs
+        let config = tree_sitter_stack_graphs_java::language_configuration(&NoCancellation);
+
+        config.sgl.build_stack_graph_into(
+            &mut graph,
+            file,
+            "",
             &Variables::new(),
             &NoCancellation,
         )?;

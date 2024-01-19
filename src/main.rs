@@ -1,11 +1,17 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 
+use anyhow::bail;
+use anyhow::Context;
+use anyhow::Result;
+use git2::Commit;
+use git2::Oid;
+use git2::Repository;
+use git2::TreeWalkMode;
+use git2::TreeWalkResult;
 use stack_graphs::arena::Handle;
 use stack_graphs::graph::Node;
 use stack_graphs::graph::StackGraph;
-use tree_sitter_stack_graphs::loader::LanguageConfiguration;
-use tree_sitter_stack_graphs::NoCancellation;
-use tree_sitter_stack_graphs_java;
 
 use crate::resolution::ResolutionCtx;
 use crate::storage::Store;
@@ -14,86 +20,74 @@ use crate::storage::StoreKey;
 mod resolution;
 mod storage;
 
-static JAVA_FILENAME_1: &'static str = "src/Greeter.java";
-
-static JAVA_SOURCE_1: &'static str = r#"public class Greeter {
-    private final String name;
-
-    public Greeter(String name) {
-        this.name = name;
+fn parse_rev<'a>(repo: &'a Repository, rev: &'a str) -> Result<Commit<'a>> {
+    if let Ok(rev) = repo.resolve_reference_from_short_name(rev) {
+        Ok(rev.peel_to_commit()?)
+    } else if let Ok(oid) = Oid::from_str(rev) {
+        Ok(repo.find_commit(oid)?)
+    } else {
+        bail!(
+            "the given revision ('{}') was not found in this repository",
+            rev
+        );
     }
-
-    public void sayHello() {
-        System.out.println("Hello, " + this.name);
-    }
-}"#;
-
-static JAVA_FILENAME_2: &'static str = "src/GreeterWrapper.java";
-
-static JAVA_SOURCE_2: &'static str = r#"public class GreeterWrapper {
-    private final Greeter greeter;
-
-    public GreeterWrapper(Greeter greeter) {
-        this.greeter = greeter;
-    }
-
-    public void sayHello() {
-        this.greeter.sayHello();
-    }
-}"#;
-
-fn print_node(graph: &StackGraph, node_handle: Handle<Node>) {
-    let node = &graph[node_handle];
-    let display = node.display(&graph);
-
-    match graph.source_info(node_handle) {
-        None => println!("{}", display),
-        Some(info) => {
-            let s = info.span.start.as_point();
-            let e = info.span.end.as_point();
-            let (sr, sc, er, ec) = (s.row, s.column, e.row, e.column);
-            println!("{}\t({}, {})\t({}, {})", display, sr, sc, er, ec)
-        }
-    };
 }
 
 fn main() -> anyhow::Result<()> {
-    let keys = vec![
-        StoreKey::new(String::new(), JAVA_FILENAME_1.to_string()),
-        StoreKey::new(String::new(), JAVA_FILENAME_2.to_string()),
-    ];
+    let repo = Repository::discover(std::env::current_dir()?)
+        .context("current directory must be inside a git repository")?;
 
-    let mut sources = HashMap::new();
-    sources.insert(keys[0].clone(), JAVA_SOURCE_1.to_string());
-    sources.insert(keys[1].clone(), JAVA_SOURCE_2.to_string());
+    // This is a necessary config for Windows. Even though we never touch the actual
+    // filesystem, because libgit2 emulates the behavior of the real git, it will
+    // still crash on Windows when encountering especially long paths.
+    repo.config()?.set_bool("core.longpaths", true)?;
 
-    let mut store = Store::open("./neodepends.db")?;
+    // Get store keys
+    let mut keys = Vec::new();
+    parse_rev(&repo, "master")?
+        .tree()?
+        .walk(TreeWalkMode::PreOrder, |dir, entry| {
+            let path = dir.to_string() + entry.name().unwrap();
+
+            if path.ends_with(".java") {
+                keys.push(StoreKey::new(entry.id().to_string(), path));
+            }
+
+            TreeWalkResult::Ok
+        })?;
+
+    // Open database in default directory
+    let mut store = Store::open(repo.path().join("neodepends.db"))?;
 
     for key in &store.find_missing(&keys)? {
         println!("Missing {}", key);
-        let mut ctx = ResolutionCtx::from_source(&sources[key], &key.filename)?;
-        store.save(key, &mut ctx)?;
+        let oid = Oid::from_str(&key.oid)?;
+        let blob = repo.find_blob(oid)?;
+        let content = blob.content();
+        let content = std::str::from_utf8(content)?;
+
+        if let Ok(mut ctx) = ResolutionCtx::from_source(&content, &key.filename) {
+            store.save(key, &mut ctx)?;
+        } else {
+            store.save(key, &mut ResolutionCtx::dummy(&key.filename)?)?;
+        }
     }
 
+    println!("Loading...");
     let mut ctx = store.load(&keys)?;
 
-    for (src, tgt) in ctx.resolve() {
-        println!("{} -> {}", src, tgt);
+    println!("Resolving...");
+    let deps = ctx.resolve().into_iter().collect::<HashSet<_>>();
+
+    println!("Printing...");
+    let mut deps = deps.into_iter().collect::<Vec<_>>();
+    deps.sort();
+
+    for (src, tgt) in deps {
+        if src != tgt {
+            println!("{} -> {}", src, tgt);
+        }
     }
-
-    // references.sort_by(|a, b| {
-    //     let a_0 = &res_ctx.graph[a.start_node()].id();
-    //     let b_0 = &res_ctx.graph[b.start_node()].id();
-    //     let a_1 = &res_ctx.graph[a.end_node()].id();
-    //     let b_1 = &res_ctx.graph[b.end_node()].id();
-    //     (a_0, a_1).cmp(&(b_0, b_1))
-    // });
-
-    // for reference in references {
-    //     print_node(&res_ctx.graph, reference.start_node);
-    //     print_node(&res_ctx.graph, reference.end_node);
-    //     println!();
-    // }
 
     Ok(())
 }
