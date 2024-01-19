@@ -14,9 +14,12 @@ tree-sitter-stack-graphs-javascript = { path = "thirdparty/stack-graphs/language
 tree-sitter-stack-graphs-typescript = { path = "thirdparty/stack-graphs/languages/tree-sitter-stack-graphs-typescript" }
 
 # Dependencies from crates.io
+log = "0.4.17"
+env_logger = "0.10.0"
+clap = { version = "3.2.23", features = ["derive", "cargo"] }
 anyhow = { version = "1.0.79", features = ["backtrace"] }
 bincode = "2.0.0-rc.3"
 rusqlite = { version = "0.28.0", features = ["bundled"] }
 tree-sitter-graph = "0.11.0"
-clap = { version = "4.4.18", features = ["derive"] }
+# clap = { version = "4.4.18", features = ["derive"] }
 git2 = "0.18.1"
