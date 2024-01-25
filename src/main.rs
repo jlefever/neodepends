@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -82,6 +83,20 @@ impl Cli {
     }
 }
 
+fn delete_file<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+
+    if path.exists() {
+        std::fs::remove_file(path)?;
+
+        if path.exists() {
+            bail!("failed to remove {}", path.to_string_lossy());
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
@@ -95,15 +110,11 @@ fn main() -> anyhow::Result<()> {
     log::info!("Index File: {}", index_file.to_string_lossy());
 
     // Clean if requested
-    if cli.clean {
-        if index_file.exists() {
+    if cli.clean && index_file.exists() {
             log::info!("Removing existing index file...");
-            std::fs::remove_file(&index_file)?;
-        }
-
-        if index_file.exists() {
-            bail!("failed to remove {}", index_file.to_string_lossy());
-        }
+        delete_file(&index_file)?;
+        delete_file(&index_file.with_extension("idx-shm"))?;
+        delete_file(&index_file.with_extension("idx-wal"))?;
     }
 
     let repo = Repository::open(&project_root).ok();
