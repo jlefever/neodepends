@@ -1,58 +1,76 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use git2::Commit;
+use clap::Parser;
 use git2::Oid;
 use git2::Repository;
-use git2::TreeWalkMode;
-use git2::TreeWalkResult;
 use log::LevelFilter;
-use stack_graphs::arena::Handle;
-use stack_graphs::graph::Node;
-use stack_graphs::graph::StackGraph;
 
+use crate::core::FileSource;
+use crate::git::GitCommit;
 use crate::resolution::ResolutionCtx;
 use crate::storage::Store;
-use crate::storage::StoreKey;
 
+mod core;
+mod git;
 mod resolution;
 mod storage;
 
-#[derive(Debug, clap::Parser)]
-#[clap(version, author)]
-#[clap(arg_required_else_help = true)]
-/// Extract structural dependencies from a particular version of source code.
+/// Scan a project and extract structural dependency information
+///
+/// If the project is a git repository, rather than pulling files from disk,
+/// Neodepends can optionally scan the project as it existed in a previous
+/// revision with the `--revision` option.
+///
+/// Neodepends relies on an index file to store already scanned files. Only
+/// files that are new or that have been modified since the last scan need to be
+/// processed. This provides signifigant performance benifits when scanning the
+/// project many times (for instance, at different revisions or after a small
+/// change).
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
 struct Cli {
-    /// Extract structural dependencies from this revision (e.g. master)
-    #[clap()]
-    commit: String,
-}
+    /// The root of the project to scan
+    ///
+    /// Defaults to the current working directory.
+    #[arg(short, long)]
+    project_root: Option<PathBuf>,
 
-fn parse_rev<'a>(repo: &'a Repository, rev: &'a str) -> Result<Commit<'a>> {
-    if let Ok(rev) = repo.resolve_reference_from_short_name(rev) {
-        Ok(rev.peel_to_commit()?)
-    } else if let Ok(oid) = Oid::from_str(rev) {
-        Ok(repo.find_commit(oid)?)
-    } else {
-        bail!(
-            "the given revision ('{}') was not found in this repository",
-            rev
-        );
-    }
+    /// The index to store and retrieve values while scanning
+    ///
+    /// Defaults to `.neodepends.idx`. Will be created if not found.
+    #[arg(short, long)]
+    index_file: Option<PathBuf>,
+
+    /// Delete the index before scanning.
+    #[arg(short, long)]
+    clean: bool,
+
+    /// The revision to scan
+    ///
+    /// If not specified, will scan recursively from the project root.
+    #[arg(short, long)]
+    revision: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::new().filter_level(LevelFilter::Info).init();
+    env_logger::Builder::new()
+        .filter_level(LevelFilter::Info)
+        .init();
 
-    let cli = <Cli as clap::Parser>::parse();
+    let cli = Cli::parse();
 
     let start = Instant::now();
 
-    let repo = Repository::discover(std::env::current_dir()?)
+    let project_root = cli.project_root.unwrap_or(std::env::current_dir()?);
+
+    let repo = Repository::open(project_root)
         .context("current directory must be inside a git repository")?;
 
     // This is a necessary config for Windows. Even though we never touch the actual
@@ -60,40 +78,32 @@ fn main() -> anyhow::Result<()> {
     // still crash on Windows when encountering especially long paths.
     repo.config()?.set_bool("core.longpaths", true)?;
 
-    // Get store keys
-    let mut keys = Vec::new();
-    parse_rev(&repo, &cli.commit)?
-        .tree()?
-        .walk(TreeWalkMode::PreOrder, |dir, entry| {
-            let path = dir.to_string() + entry.name().unwrap();
-
-            if path.ends_with(".java") {
-                keys.push(StoreKey::new(entry.id().to_string(), path));
-            }
-
-            TreeWalkResult::Ok
-        })?;
+    let revision = cli
+        .revision
+        .context("reading from filesystem not yet supported")?;
+    let file_source = GitCommit::from_str(&repo, revision)?;
+    let keys = file_source.discover()?;
 
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
-    // Open database in default directory
-    let mut store = Store::open(repo.path().join("neodepends.db"))?;
+    let mut store = Store::open(repo.path().join(".neodepends.idx"))?;
     let missing = &store.find_missing(&keys)?;
-    log::info!("Processing {} file(s) which were not found in index...", missing.len());
+    log::info!(
+        "Processing {} file(s) which were not found in index...",
+        missing.len()
+    );
 
     for (i, key) in missing.iter().enumerate() {
         log::info!("[{}/{}] Processing {}...", i + 1, missing.len(), key);
-        let oid = Oid::from_str(&key.oid)?;
-        let blob = repo.find_blob(oid)?;
-        let content = blob.content();
-        let content = std::str::from_utf8(content)?;
+        let content = file_source.load(key)?;
+        let content = std::str::from_utf8(&content)?;
 
         match ResolutionCtx::from_source(&content, &key.filename) {
             Ok(mut ctx) => store.save(key, &mut ctx)?,
             Err(err) => {
                 // log::warn!("Failed to process {} [{}]", key, err);
                 store.save(key, &mut ResolutionCtx::dummy(&key.filename)?)?;
-            },
+            }
         };
     }
 

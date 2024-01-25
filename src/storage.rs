@@ -1,51 +1,33 @@
 use std::collections::HashSet;
-use std::fmt;
 use std::path::Path;
 
 use anyhow::bail;
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::core::FileKey;
 use crate::resolution::ResolutionCtx;
 
 const TABLES: &'static str = r#"
     CREATE TABLE files (
-        oid TEXT NOT NULL,
         filename TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
         value BLOB NOT NULL,
-        PRIMARY KEY (oid, filename)
+        PRIMARY KEY (filename, content_hash)
     ) STRICT;
 "#;
 
 const TEMP_TABLES: &'static str = r#"
     CREATE TEMP TABLE working_files (
-        oid TEXT NOT NULL,
         filename TEXT NOT NULL,
-        PRIMARY KEY (oid, filename)
+        content_hash TEXT NOT NULL,
+        PRIMARY KEY (filename, content_hash)
     ) STRICT;
 "#;
 
 const PRAGMAS: &str = r#"
     PRAGMA journal_mode = WAL;
 "#;
-
-#[derive(PartialEq, Eq, Hash, Debug, Clone)]
-pub struct StoreKey {
-    pub oid: String,
-    pub filename: String,
-}
-
-impl StoreKey {
-    pub fn new(oid: String, filename: String) -> Self {
-        Self { oid, filename }
-    }
-}
-
-impl fmt::Display for StoreKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.filename, self.oid)
-    }
-}
 
 pub struct Store {
     conn: Connection,
@@ -63,23 +45,23 @@ impl Store {
         Ok(Self { conn })
     }
 
-    pub fn save(&mut self, key: &StoreKey, ctx: &mut ResolutionCtx) -> Result<()> {
+    pub fn save(&mut self, key: &FileKey, ctx: &mut ResolutionCtx) -> Result<()> {
         self.conn
-            .prepare_cached("INSERT INTO files (oid, filename, value) VALUES (?, ?, ?)")?
-            .execute((&key.oid, &key.filename, ctx.encode()?))?;
+            .prepare_cached("INSERT INTO files (filename, content_hash, value) VALUES (?, ?, ?)")?
+            .execute((&key.filename, &key.content_hash.to_string(), ctx.encode()?))?;
         Ok(())
     }
 
     pub fn load<'a, K>(&mut self, keys: K) -> Result<ResolutionCtx>
     where
-        K: IntoIterator<Item = &'a StoreKey>,
+        K: IntoIterator<Item = &'a FileKey>,
     {
         self.prepare_working_files(keys)?;
 
         let mut stmt = self.conn.prepare_cached(
-            r#"SELECT W.oid, W.filename, F.value
+            r#"SELECT W.filename, W.content_hash, F.value
             FROM working_files W
-            LEFT JOIN files F ON F.oid = W.oid AND F.filename = W.filename"#,
+            LEFT JOIN files F ON F.filename = W.filename AND F.content_hash = W.content_hash"#,
         )?;
 
         let mut rows = stmt.query([])?;
@@ -91,7 +73,7 @@ impl Store {
             match value {
                 Some(v) => bytes.push(v),
                 None => {
-                    let key = StoreKey::new(row.get(0)?, row.get(1)?);
+                    let key = FileKey::from_string(row.get(0)?, row.get(1)?)?;
                     bail!("no value found for {}", key);
                 }
             };
@@ -100,38 +82,41 @@ impl Store {
         Ok(ResolutionCtx::decode_many(bytes.iter().map(|b| &b[..]))?)
     }
 
-    pub fn find_missing<'a, K>(&mut self, keys: K) -> Result<HashSet<StoreKey>>
+    pub fn find_missing<'a, K>(&mut self, keys: K) -> Result<HashSet<FileKey>>
     where
-        K: IntoIterator<Item = &'a StoreKey>,
+        K: IntoIterator<Item = &'a FileKey>,
     {
         self.prepare_working_files(keys)?;
 
         let mut stmt = self.conn.prepare_cached(
-            r#"SELECT W.oid, W.filename
+            r#"SELECT W.filename, W.content_hash
             FROM working_files W
-            LEFT JOIN files F ON F.oid = W.oid AND F.filename = W.filename
+            LEFT JOIN files F ON F.filename = W.filename AND F.content_hash = W.content_hash
             WHERE F.value IS NULL"#,
         )?;
 
-        let results: rusqlite::Result<HashSet<StoreKey>> = stmt
-            .query_map([], |r| Ok(StoreKey::new(r.get(0)?, r.get(1)?)))?
-            .collect();
+        let mut rows = stmt.query([])?;
+        let mut keys = HashSet::new();
 
-        Ok(results?)
+        while let Some(row) = rows.next()? {
+            keys.insert(FileKey::from_string(row.get(0)?, row.get(1)?)?);
+        }
+
+        Ok(keys)
     }
 
     fn prepare_working_files<'a, K>(&mut self, keys: K) -> Result<()>
     where
-        K: IntoIterator<Item = &'a StoreKey>,
+        K: IntoIterator<Item = &'a FileKey>,
     {
         self.conn
             .prepare_cached("DELETE FROM working_files")?
             .execute([])?;
         let mut stmt = self
             .conn
-            .prepare_cached("INSERT INTO working_files (oid, filename) VALUES (?, ?)")?;
+            .prepare_cached("INSERT INTO working_files (filename, content_hash) VALUES (?, ?)")?;
         for key in keys {
-            stmt.execute((&key.oid, &key.filename))?;
+            stmt.execute((&key.filename, &key.content_hash.to_string()))?;
         }
         Ok(())
     }
