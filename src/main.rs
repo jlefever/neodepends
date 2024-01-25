@@ -7,12 +7,15 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::Parser;
 use git2::Repository;
+use itertools::Itertools;
 use log::LevelFilter;
 
 use crate::loading::DiskFileLoader;
 use crate::loading::FileLoader;
 use crate::loading::GitFileLoader;
-use crate::resolution::ResolutionCtx;
+use crate::resolution::resolve;
+use crate::resolution::StackGraphCtx;
+use crate::storage::LoadResponse;
 use crate::storage::Store;
 
 mod core;
@@ -111,7 +114,7 @@ fn main() -> anyhow::Result<()> {
 
     // Clean if requested
     if cli.clean && index_file.exists() {
-            log::info!("Removing existing index file...");
+        log::info!("Removing existing index file...");
         delete_file(&index_file)?;
         delete_file(&index_file.with_extension("idx-shm"))?;
         delete_file(&index_file.with_extension("idx-wal"))?;
@@ -136,14 +139,11 @@ fn main() -> anyhow::Result<()> {
 
     let start = Instant::now();
 
-    let mut keys = file_loader.discover()?;
-    keys.sort();
+    let keys = file_loader.discover()?;
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
     let mut store = Store::open(&index_file)?;
     let missing = &store.find_missing(&keys)?;
-    let mut missing = missing.into_iter().collect::<Vec<_>>();
-    missing.sort();
     log::info!(
         "Processing {} file(s) which were not found in index...",
         missing.len()
@@ -153,21 +153,29 @@ fn main() -> anyhow::Result<()> {
         log::info!("[{}/{}] Processing {}...", i + 1, missing.len(), key);
         let content = file_loader.load(key)?;
         let content = std::str::from_utf8(&content)?;
+        let res = StackGraphCtx::build(&content, &key.filename);
 
-        match ResolutionCtx::from_source(&content, &key.filename) {
-            Ok(mut ctx) => store.save(key, &mut ctx)?,
-            Err(_) => {
-                // log::warn!("Failed to process {} [{}]", key, err);
-                store.save(key, &mut ResolutionCtx::dummy(&key.filename)?)?;
-            }
-        };
+        if res.is_err() {
+            log::warn!("Failed to build stack graph for {}", key);
+        }
+
+        store.save(key, res.map_err(|err| err.to_string()))?;
     }
 
     log::info!("Loading resolution context for all {} files...", keys.len());
-    let mut ctx = store.load(&keys)?;
+    let LoadResponse { mut ctx, failures } = store.load(&keys)?;
+
+    if failures.len() > 0 {
+        log::warn!(
+            "The following {} files have failed to be built into stack graphs and therefore will \
+             not be considered during dependency resolution:\n{}",
+            failures.len(),
+            failures.keys().sorted().map(|k| k.to_string()).join("\n")
+        );
+    }
 
     log::info!("Resolving all references...");
-    let deps = ctx.resolve().into_iter().collect::<HashSet<_>>();
+    let deps = resolve(&mut ctx).into_iter().collect::<HashSet<_>>();
 
     log::info!("Writing output...");
     let mut deps = deps.into_iter().collect::<Vec<_>>();

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::bail;
@@ -6,14 +6,17 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::core::FileKey;
-use crate::resolution::ResolutionCtx;
+use crate::resolution::StackGraphCtx;
 
 const TABLES: &'static str = r#"
     CREATE TABLE files (
         filename TEXT NOT NULL,
         content_hash TEXT NOT NULL,
-        value BLOB NOT NULL,
-        PRIMARY KEY (filename, content_hash)
+        graph BLOB,
+        failure TEXT,
+        PRIMARY KEY (filename, content_hash),
+        CHECK ((graph IS NULL OR failure IS NULL) AND
+               (graph IS NOT NULL OR failure IS NOT NULL))
     ) STRICT;
 "#;
 
@@ -33,6 +36,11 @@ pub struct Store {
     conn: Connection,
 }
 
+pub struct LoadResponse {
+    pub ctx: StackGraphCtx,
+    pub failures: HashMap<FileKey, String>,
+}
+
 impl Store {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Store> {
         let is_new = !path.as_ref().exists();
@@ -45,44 +53,68 @@ impl Store {
         Ok(Self { conn })
     }
 
-    pub fn save(&mut self, key: &FileKey, ctx: &mut ResolutionCtx) -> Result<()> {
-        self.conn
-            .prepare_cached("INSERT INTO files (filename, content_hash, value) VALUES (?, ?, ?)")?
-            .execute((&key.filename, &key.content_hash.to_string(), ctx.encode()?))?;
+    pub fn save(&mut self, key: &FileKey, value: Result<StackGraphCtx, String>) -> Result<()> {
+        match value {
+            Ok(ctx) => self.save_ctx(key, ctx),
+            Err(failure) => self.save_failure(key, failure),
+        }
+    }
+
+    pub fn save_ctx(&mut self, key: &FileKey, mut ctx: StackGraphCtx) -> Result<()> {
+        let sql = "INSERT INTO files (filename, content_hash, graph) VALUES (?, ?, ?)";
+        self.conn.prepare_cached(sql)?.execute((
+            &key.filename,
+            &key.content_hash.to_string(),
+            ctx.encode()?,
+        ))?;
         Ok(())
     }
 
-    pub fn load<'a, K>(&mut self, keys: K) -> Result<ResolutionCtx>
+    pub fn save_failure(&mut self, key: &FileKey, failure: String) -> Result<()> {
+        let sql = "INSERT INTO files (filename, content_hash, failure) VALUES (?, ?, ?)";
+        self.conn.prepare_cached(sql)?.execute((
+            &key.filename,
+            &key.content_hash.to_string(),
+            failure,
+        ))?;
+        Ok(())
+    }
+
+    pub fn load<'a, K>(&mut self, keys: K) -> Result<LoadResponse>
     where
         K: IntoIterator<Item = &'a FileKey>,
     {
         self.prepare_working_files(keys)?;
 
         let mut stmt = self.conn.prepare_cached(
-            r#"SELECT W.filename, W.content_hash, F.value
+            r#"SELECT W.filename, W.content_hash, F.graph, F.failure
             FROM working_files W
             LEFT JOIN files F ON F.filename = W.filename AND F.content_hash = W.content_hash"#,
         )?;
 
         let mut rows = stmt.query([])?;
         let mut bytes: Vec<Vec<u8>> = Vec::new();
+        let mut failures = HashMap::new();
 
         while let Some(row) = rows.next()? {
-            let value: Option<Vec<u8>> = row.get(2)?;
+            let key = FileKey::from_string(row.get(0)?, row.get(1)?)?;
+            let ctx: Option<Vec<u8>> = row.get(2)?;
+            let failure: Option<String> = row.get(3)?;
 
-            match value {
-                Some(v) => bytes.push(v),
-                None => {
-                    let key = FileKey::from_string(row.get(0)?, row.get(1)?)?;
-                    bail!("no value found for {}", key);
-                }
-            };
+            if let Some(failure) = failure {
+                failures.insert(key, failure);
+            } else if let Some(ctx) = ctx {
+                bytes.push(ctx);
+            } else {
+                bail!("no value found for {}", key);
+            }
         }
 
-        Ok(ResolutionCtx::decode_many(bytes.iter().map(|b| &b[..]))?)
+        let ctx = StackGraphCtx::decode_many(bytes.iter().map(|b| &b[..]))?;
+        Ok(LoadResponse { ctx, failures })
     }
 
-    pub fn find_missing<'a, K>(&mut self, keys: K) -> Result<HashSet<FileKey>>
+    pub fn find_missing<'a, K>(&mut self, keys: K) -> Result<Vec<FileKey>>
     where
         K: IntoIterator<Item = &'a FileKey>,
     {
@@ -92,16 +124,17 @@ impl Store {
             r#"SELECT W.filename, W.content_hash
             FROM working_files W
             LEFT JOIN files F ON F.filename = W.filename AND F.content_hash = W.content_hash
-            WHERE F.value IS NULL"#,
+            WHERE F.graph IS NULL AND F.failure IS NULL"#,
         )?;
 
         let mut rows = stmt.query([])?;
-        let mut keys = HashSet::new();
+        let mut keys = Vec::new();
 
         while let Some(row) = rows.next()? {
-            keys.insert(FileKey::from_string(row.get(0)?, row.get(1)?)?);
+            keys.push(FileKey::from_string(row.get(0)?, row.get(1)?)?);
         }
 
+        keys.sort();
         Ok(keys)
     }
 
