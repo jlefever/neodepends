@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -59,6 +60,32 @@ struct Cli {
     revision: Option<String>,
 }
 
+impl Cli {
+    fn project_root(&self) -> Result<PathBuf> {
+        Ok(self
+            .project_root
+            .clone()
+            .unwrap_or(std::env::current_dir()?))
+    }
+
+    fn index_file(&self) -> Result<PathBuf> {
+        let project_root = self.project_root()?;
+        let git_dir = project_root.join(".git");
+        let preferred = git_dir.join(".neodepends.idx");
+        let fallback = project_root.join(".neodepends.idx");
+
+        if preferred.exists() {
+            Ok(preferred)
+        } else if fallback.exists() {
+            Ok(fallback)
+        } else if git_dir.exists() {
+            Ok(preferred)
+        } else {
+            Ok(fallback)
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
@@ -66,9 +93,22 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let start = Instant::now();
+    let project_root = cli.project_root()?;
+    let index_file = cli.index_file()?;
+    log::info!("Project Root: {}", project_root.to_string_lossy());
+    log::info!("Index File: {}", index_file.to_string_lossy());
 
-    let project_root = cli.project_root.unwrap_or(std::env::current_dir()?);
+    // Clean if requested
+    if cli.clean {
+        if index_file.exists() {
+            log::info!("Removing existing index file...");
+            std::fs::remove_file(&index_file)?;
+        }
+
+        if index_file.exists() {
+            bail!("failed to remove {}", index_file.to_string_lossy());
+        }
+    }
 
     let repo = Repository::open(project_root)
         .context("current directory must be inside a git repository")?;
@@ -78,6 +118,8 @@ fn main() -> anyhow::Result<()> {
     // still crash on Windows when encountering especially long paths.
     repo.config()?.set_bool("core.longpaths", true)?;
 
+    let start = Instant::now();
+
     let revision = cli
         .revision
         .context("reading from filesystem not yet supported")?;
@@ -86,7 +128,7 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
-    let mut store = Store::open(repo.path().join(".neodepends.idx"))?;
+    let mut store = Store::open(&index_file)?;
     let missing = &store.find_missing(&keys)?;
     log::info!(
         "Processing {} file(s) which were not found in index...",
@@ -124,5 +166,33 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("Finished in {}ms", start.elapsed().as_millis());
+    Ok(())
+}
+
+fn main2() -> anyhow::Result<()> {
+    let project_dir = "/Users/jtl86/source/java/depends2";
+    let file_path = "src/main/java/depends/generator/DependencyGenerator.java";
+    let blob_oid = "b1bc4a8366988c0de8baa260114cee5d73374266";
+
+    let repo = Repository::discover(project_dir).unwrap();
+    let oid = Oid::from_str(blob_oid)?;
+    let blob = repo.find_blob(oid)?;
+
+    println!(
+        "{:?}",
+        Oid::hash_object(git2::ObjectType::Blob, blob.content())?
+    );
+    // println!("{}", std::str::from_utf8(blob.content())?);
+
+    let mut buf = Vec::new();
+    File::open(Path::new(project_dir).join(file_path))?.read_to_end(&mut buf)?;
+
+    println!("{:?}", Oid::hash_object(git2::ObjectType::Blob, &buf)?);
+    // println!("{}", std::str::from_utf8(&buf)?);
+
+    let arr: [u8; 20] = unsafe { std::mem::transmute(oid) };
+
+    println!("{:x?}", arr);
+
     Ok(())
 }
