@@ -1,25 +1,21 @@
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::bail;
-use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
-use git2::Oid;
 use git2::Repository;
 use log::LevelFilter;
 
-use crate::core::FileSource;
-use crate::git::GitCommit;
+use crate::loading::DiskFileLoader;
+use crate::loading::FileLoader;
+use crate::loading::GitFileLoader;
 use crate::resolution::ResolutionCtx;
 use crate::storage::Store;
 
 mod core;
-mod git;
+mod loading;
 mod resolution;
 mod storage;
 
@@ -110,26 +106,33 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let repo = Repository::open(project_root)
-        .context("current directory must be inside a git repository")?;
+    let repo = Repository::open(&project_root).ok();
 
-    // This is a necessary config for Windows. Even though we never touch the actual
-    // filesystem, because libgit2 emulates the behavior of the real git, it will
-    // still crash on Windows when encountering especially long paths.
-    repo.config()?.set_bool("core.longpaths", true)?;
+    if repo.is_none() && cli.revision.is_some() {
+        bail!("a revision was supplied but the project root does not refer to a git repository")
+    }
+
+    let file_loader: Box<dyn FileLoader> = if cli.revision.is_none() {
+        Box::new(DiskFileLoader::new(project_root.clone()))
+    } else {
+        let repo = repo.as_ref().unwrap();
+
+        // This is a necessary config for Windows
+        repo.config()?.set_bool("core.longpaths", true)?;
+
+        Box::new(GitFileLoader::from_str(repo, cli.revision.unwrap())?)
+    };
 
     let start = Instant::now();
 
-    let revision = cli
-        .revision
-        .context("reading from filesystem not yet supported")?;
-    let file_source = GitCommit::from_str(&repo, revision)?;
-    let keys = file_source.discover()?;
-
+    let mut keys = file_loader.discover()?;
+    keys.sort();
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
     let mut store = Store::open(&index_file)?;
     let missing = &store.find_missing(&keys)?;
+    let mut missing = missing.into_iter().collect::<Vec<_>>();
+    missing.sort();
     log::info!(
         "Processing {} file(s) which were not found in index...",
         missing.len()
@@ -137,12 +140,12 @@ fn main() -> anyhow::Result<()> {
 
     for (i, key) in missing.iter().enumerate() {
         log::info!("[{}/{}] Processing {}...", i + 1, missing.len(), key);
-        let content = file_source.load(key)?;
+        let content = file_loader.load(key)?;
         let content = std::str::from_utf8(&content)?;
 
         match ResolutionCtx::from_source(&content, &key.filename) {
             Ok(mut ctx) => store.save(key, &mut ctx)?,
-            Err(err) => {
+            Err(_) => {
                 // log::warn!("Failed to process {} [{}]", key, err);
                 store.save(key, &mut ResolutionCtx::dummy(&key.filename)?)?;
             }
@@ -166,33 +169,5 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("Finished in {}ms", start.elapsed().as_millis());
-    Ok(())
-}
-
-fn main2() -> anyhow::Result<()> {
-    let project_dir = "/Users/jtl86/source/java/depends2";
-    let file_path = "src/main/java/depends/generator/DependencyGenerator.java";
-    let blob_oid = "b1bc4a8366988c0de8baa260114cee5d73374266";
-
-    let repo = Repository::discover(project_dir).unwrap();
-    let oid = Oid::from_str(blob_oid)?;
-    let blob = repo.find_blob(oid)?;
-
-    println!(
-        "{:?}",
-        Oid::hash_object(git2::ObjectType::Blob, blob.content())?
-    );
-    // println!("{}", std::str::from_utf8(blob.content())?);
-
-    let mut buf = Vec::new();
-    File::open(Path::new(project_dir).join(file_path))?.read_to_end(&mut buf)?;
-
-    println!("{:?}", Oid::hash_object(git2::ObjectType::Blob, &buf)?);
-    // println!("{}", std::str::from_utf8(&buf)?);
-
-    let arr: [u8; 20] = unsafe { std::mem::transmute(oid) };
-
-    println!("{:x?}", arr);
-
     Ok(())
 }
