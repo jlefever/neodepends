@@ -4,12 +4,17 @@ use std::path::Path;
 use anyhow::bail;
 use anyhow::Result;
 use rusqlite::Connection;
+use rusqlite::Transaction;
 
 use crate::core::FileKey;
 use crate::resolution::StackGraphCtx;
 
-const TABLES: &'static str = r#"
-    CREATE TABLE files (
+const PRAGMAS: &str = r#"
+    PRAGMA journal_mode = WAL;
+"#;
+
+const TABLES: &str = r#"
+    CREATE TABLE IF NOT EXISTS files (
         filename TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         graph BLOB,
@@ -20,16 +25,12 @@ const TABLES: &'static str = r#"
     ) STRICT;
 "#;
 
-const TEMP_TABLES: &'static str = r#"
+const TEMP_TABLES: &str = r#"
     CREATE TEMP TABLE working_files (
         filename TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         PRIMARY KEY (filename, content_hash)
     ) STRICT;
-"#;
-
-const PRAGMAS: &str = r#"
-    PRAGMA journal_mode = WAL;
 "#;
 
 pub struct Store {
@@ -43,24 +44,21 @@ pub struct LoadResponse {
 
 impl Store {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Store> {
-        let is_new = !path.as_ref().exists();
         let conn = Connection::open(path)?;
         conn.execute_batch(PRAGMAS)?;
-        if is_new {
-            conn.execute_batch(TABLES)?;
-        }
+        conn.execute_batch(TABLES)?;
         conn.execute_batch(TEMP_TABLES)?;
         Ok(Self { conn })
     }
 
-    pub fn save(&mut self, key: &FileKey, value: Result<StackGraphCtx, String>) -> Result<()> {
+    pub fn save(&self, key: &FileKey, value: Result<StackGraphCtx, String>) -> Result<()> {
         match value {
             Ok(ctx) => self.save_ctx(key, ctx),
             Err(failure) => self.save_failure(key, failure),
         }
     }
 
-    pub fn save_ctx(&mut self, key: &FileKey, mut ctx: StackGraphCtx) -> Result<()> {
+    fn save_ctx(&self, key: &FileKey, mut ctx: StackGraphCtx) -> Result<()> {
         let sql = "INSERT INTO files (filename, content_hash, graph) VALUES (?, ?, ?)";
         self.conn.prepare_cached(sql)?.execute((
             &key.filename,
@@ -70,7 +68,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn save_failure(&mut self, key: &FileKey, failure: String) -> Result<()> {
+    fn save_failure(&self, key: &FileKey, failure: String) -> Result<()> {
         let sql = "INSERT INTO files (filename, content_hash, failure) VALUES (?, ?, ?)";
         self.conn.prepare_cached(sql)?.execute((
             &key.filename,
@@ -80,13 +78,21 @@ impl Store {
         Ok(())
     }
 
-    pub fn load<'a, K>(&mut self, keys: K) -> Result<LoadResponse>
+    pub fn load<'a, K>(&self, keys: K) -> Result<LoadResponse>
     where
         K: IntoIterator<Item = &'a FileKey>,
     {
-        self.prepare_working_files(keys)?;
+        let tx = self.conn.unchecked_transaction()?;
+        Self::load_inner(&tx, keys)
+    }
 
-        let mut stmt = self.conn.prepare_cached(
+    fn load_inner<'a, K>(tx: &Transaction, keys: K) -> Result<LoadResponse>
+    where
+        K: IntoIterator<Item = &'a FileKey>,
+    {
+        Self::prepare_working_files(tx, keys)?;
+
+        let mut stmt = tx.prepare_cached(
             r#"SELECT W.filename, W.content_hash, F.graph, F.failure
             FROM working_files W
             LEFT JOIN files F ON F.filename = W.filename AND F.content_hash = W.content_hash"#,
@@ -114,13 +120,21 @@ impl Store {
         Ok(LoadResponse { ctx, failures })
     }
 
-    pub fn find_missing<'a, K>(&mut self, keys: K) -> Result<Vec<FileKey>>
+    pub fn find_missing<'a, K>(&self, keys: K) -> Result<Vec<FileKey>>
     where
         K: IntoIterator<Item = &'a FileKey>,
     {
-        self.prepare_working_files(keys)?;
+        let tx = self.conn.unchecked_transaction()?;
+        Self::find_missing_inner(&tx, keys)
+    }
 
-        let mut stmt = self.conn.prepare_cached(
+    fn find_missing_inner<'a, K>(tx: &Transaction, keys: K) -> Result<Vec<FileKey>>
+    where
+        K: IntoIterator<Item = &'a FileKey>,
+    {
+        Self::prepare_working_files(tx, keys)?;
+
+        let mut stmt = tx.prepare_cached(
             r#"SELECT W.filename, W.content_hash
             FROM working_files W
             LEFT JOIN files F ON F.filename = W.filename AND F.content_hash = W.content_hash
@@ -138,16 +152,14 @@ impl Store {
         Ok(keys)
     }
 
-    fn prepare_working_files<'a, K>(&mut self, keys: K) -> Result<()>
+    fn prepare_working_files<'a, K>(tx: &Transaction<'_>, keys: K) -> Result<()>
     where
         K: IntoIterator<Item = &'a FileKey>,
     {
-        self.conn
-            .prepare_cached("DELETE FROM working_files")?
+        tx.prepare_cached("DELETE FROM working_files")?
             .execute([])?;
-        let mut stmt = self
-            .conn
-            .prepare_cached("INSERT INTO working_files (filename, content_hash) VALUES (?, ?)")?;
+        let mut stmt =
+            tx.prepare_cached("INSERT INTO working_files (filename, content_hash) VALUES (?, ?)")?;
         for key in keys {
             stmt.execute((&key.filename, &key.content_hash.to_string()))?;
         }
