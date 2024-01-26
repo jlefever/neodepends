@@ -103,7 +103,7 @@ impl Store {
         let mut failures = HashMap::new();
 
         while let Some(row) = rows.next()? {
-            let key = FileKey::from_string(row.get(0)?, row.get(1)?)?;
+            let key = FileKey::from_strings(row.get(0)?, row.get(1)?)?;
             let ctx: Option<Vec<u8>> = row.get(2)?;
             let failure: Option<String> = row.get(3)?;
 
@@ -145,7 +145,7 @@ impl Store {
         let mut keys = Vec::new();
 
         while let Some(row) = rows.next()? {
-            keys.push(FileKey::from_string(row.get(0)?, row.get(1)?)?);
+            keys.push(FileKey::from_strings(row.get(0)?, row.get(1)?)?);
         }
 
         keys.sort();

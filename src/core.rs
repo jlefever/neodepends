@@ -14,13 +14,21 @@ impl FileKey {
         }
     }
 
-    pub fn from_string(filename: String, content_hash: String) -> anyhow::Result<Self> {
+    pub fn from_strings(filename: String, content_hash: String) -> anyhow::Result<Self> {
         Ok(Self::new(filename, Oid::from_str(&content_hash)?))
+    }
+
+    pub fn to_string(&self, include_hash: bool) -> String {
+        if include_hash {
+            format!("[{}] {}", self.content_hash, self.filename)
+        } else {
+            format!("{}", self.filename)
+        }
     }
 }
 
 impl std::fmt::Display for FileKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.filename, self.content_hash)
+        write!(f, "{}", self.to_string(true))
     }
 }

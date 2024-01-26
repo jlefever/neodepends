@@ -11,8 +11,13 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use clap_verbosity_flag::InfoLevel;
+use clap_verbosity_flag::Verbosity;
+use indicatif::MultiProgress;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
+use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
-use log::LevelFilter;
 
 use crate::loading::FileSystem;
 use crate::resolution::resolve;
@@ -31,12 +36,12 @@ const DEFAULT_INDEX_FILE: &str = ".neodepends.db";
 ///
 /// If the project is a git repository, rather than pulling files from disk,
 /// Neodepends can optionally scan the project as it existed in a previous
-/// revision with the `--revision` option.
+/// commit with the `--commit` option.
 ///
 /// Neodepends relies on an index file to store already scanned files. Only
 /// files that are new or that have been modified since the last scan need to be
 /// processed. This provides signifigant performance benifits when scanning the
-/// project many times (for instance, at different revisions or after a small
+/// project many times (for instance, at different commits or after a small
 /// change).
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -55,24 +60,29 @@ struct Args {
     index_file: Option<PathBuf>,
 
     /// Delete the index before scanning.
-    #[arg(short, long)]
+    #[arg(long)]
     clean: bool,
 
     /// A commit to scan instead of the files on disk
     ///
-    /// If not specified, will scan recursively from the project root. May be
-    /// specified in many formats including human-readable and sha-1 hash, e.g.
-    /// "main", "origin/main", "refs/heads/main",
-    /// "27b5926474deffa7c77df5a3279bad631c6404f0", etc.
-    #[arg(short, long)]
+    /// If not specified, will scan recursively from the project root. Can be a
+    /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
+    #[arg(long)]
     commit: Option<String>,
 
     /// Number of threads to use when processing files
     ///
-    /// If 0, Neodepends will set this automatically (typically as the number of
-    /// CPU cores)
+    /// If 0, this will be set automatically (typically as the number of CPU
+    /// cores)
     #[arg(short, long, default_value_t = 0)]
     num_threads: usize,
+
+    /// Include the hashes of file contents (i.e. blobs) in the log output
+    #[arg(long)]
+    log_content_hashes: bool,
+
+    #[command(flatten)]
+    verbose: Verbosity<InfoLevel>,
 }
 
 fn project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -110,6 +120,7 @@ struct ProcessedArgs {
     clean: bool,
     commit: Option<String>,
     num_threads: NonZeroUsize,
+    log_content_hashes: bool,
 }
 
 impl ProcessedArgs {
@@ -124,6 +135,7 @@ impl ProcessedArgs {
             clean: args.clean,
             commit: args.commit,
             num_threads,
+            log_content_hashes: args.log_content_hashes,
         })
     }
 
@@ -160,11 +172,15 @@ fn clean<P: AsRef<Path>>(index_file: P) -> Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::new()
-        .filter_level(LevelFilter::Info)
-        .init();
-
-    let cli = ProcessedArgs::process(Args::parse())?;
+    let cli = Args::parse();
+    let logger = env_logger::Builder::new()
+        .filter_level(cli.verbose.log_level_filter())
+        .build();
+    let cli = ProcessedArgs::process(cli)?;
+    let multi_progress = MultiProgress::new();
+    LogWrapper::new(multi_progress.clone(), logger)
+        .try_init()
+        .unwrap();
 
     if cli.clean {
         clean(&cli.index_file)?;
@@ -178,49 +194,65 @@ fn main() -> anyhow::Result<()> {
 
     let store = Store::open(&cli.index_file)?;
     let missing = store.find_missing(&keys)?;
-    log::info!(
-        "Processing {} file(s) which were not found in index...",
-        missing.len()
-    );
 
-    let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
-    let num_per_thread = cli.num_per_thread(missing.len());
+    if missing.len() > 0 {
+        log::info!(
+            "Processing {} file(s) which were not found in index...",
+            missing.len()
+        );
+        let bar = multi_progress
+            .add(ProgressBar::new(missing.len() as u64))
+            .with_style(ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40} {pos}/{len} (ETA: {eta_precise}) {msg}",
+            )?);
 
-    for chunk in &missing.into_iter().chunks(num_per_thread) {
-        let chunk = chunk.collect::<Vec<_>>();
-        let project_root = cli.project_root.clone();
-        let index_file = cli.index_file.clone();
-        let commit = cli.commit.clone();
+        let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
+        let num_per_thread = cli.num_per_thread(missing.len());
 
-        handles.push(thread::spawn(move || {
-            let fs = FileSystem::open(project_root, &commit)?;
-            let store = Store::open(index_file)?;
+        for chunk in &missing.into_iter().chunks(num_per_thread) {
+            let chunk = chunk.collect::<Vec<_>>();
+            let project_root = cli.project_root.clone();
+            let index_file = cli.index_file.clone();
+            let commit = cli.commit.clone();
+            let bar = bar.clone();
 
-            for key in &chunk {
-                log::info!("Processing {}...", key);
-                let content = fs.load_file(key)?;
-                let content = std::str::from_utf8(&content)?;
-                let res = StackGraphCtx::build(&content, &key.filename);
+            handles.push(thread::spawn(move || {
+                let fs = FileSystem::open(project_root, &commit)?;
+                let store = Store::open(index_file)?;
 
-                if res.is_err() {
-                    log::warn!("Failed to build stack graph for {}", key);
+                for key in &chunk {
+                    let key_name = key.to_string(cli.log_content_hashes);
+                    let msg = format!("Processing {}...", &key_name);
+                    log::debug!("{}", msg);
+                    bar.set_message(msg);
+                    let content = fs.load_file(key)?;
+                    let content = std::str::from_utf8(&content)?;
+                    let res = StackGraphCtx::build(&content, &key.filename);
+
+                    if res.is_err() {
+                        log::warn!("Failed to build stack graph for {}", &key_name);
+                    }
+
+                    store.save(&key, res.map_err(|err| err.to_string()))?;
+                    bar.inc(1);
                 }
 
-                store.save(&key, res.map_err(|err| err.to_string()))?;
-            }
+                Ok(())
+            }));
+        }
 
-            Ok(())
-        }));
+        for handle in handles {
+            handle
+                .join()
+                .expect("could not join thread")
+                .context("error in thread")?;
+        }
+
+        bar.finish();
+        multi_progress.remove(&bar);
     }
 
-    for handle in handles {
-        handle
-            .join()
-            .expect("could not join thread")
-            .context("error in thread")?;
-    }
-
-    log::info!("Loading resolution context for all {} files...", keys.len());
+    log::info!("Loading stack graphs for all {} files...", keys.len());
     let LoadResponse { mut ctx, failures } = store.load(&keys)?;
 
     if failures.len() > 0 {
@@ -228,7 +260,11 @@ fn main() -> anyhow::Result<()> {
             "The following {} files have failed to be built into stack graphs and therefore will \
              not be considered during dependency resolution:\n{}",
             failures.len(),
-            failures.keys().sorted().map(|k| k.to_string()).join("\n")
+            failures
+                .keys()
+                .sorted()
+                .map(|k| k.to_string(cli.log_content_hashes))
+                .join("\n")
         );
     }
 
@@ -242,6 +278,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    log::info!("Finished in {}ms", start.elapsed().as_millis());
+    log::info!("Finished in {}ms.", start.elapsed().as_millis());
     Ok(())
 }
