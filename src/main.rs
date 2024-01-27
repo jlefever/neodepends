@@ -19,6 +19,7 @@ use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
 
+use crate::dv8::Dv8Matrix;
 use crate::loading::FileSystem;
 use crate::resolution::resolve;
 use crate::resolution::StackGraphCtx;
@@ -26,6 +27,7 @@ use crate::storage::LoadResponse;
 use crate::storage::Store;
 
 mod core;
+mod dv8;
 mod loading;
 mod resolution;
 mod storage;
@@ -70,6 +72,12 @@ struct Args {
     #[arg(long)]
     commit: Option<String>,
 
+    /// Name of dependency matrix in JSON output
+    ///
+    /// Defaults to the last component of the project root.
+    #[arg(long)]
+    name: Option<String>,
+
     /// Number of threads to use when processing files
     ///
     /// If 0, this will be set automatically (typically as the number of CPU
@@ -107,6 +115,17 @@ fn index_file<P: AsRef<Path>>(index_file: Option<PathBuf>, project_root: P) -> R
     }))
 }
 
+fn name<P: AsRef<Path>>(name: Option<String>, project_root: P) -> String {
+    name.unwrap_or_else(|| {
+        project_root
+            .as_ref()
+            .components()
+            .last()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or("".to_string())
+    })
+}
+
 fn num_threads(num_threads: usize) -> Result<NonZeroUsize> {
     Ok(match NonZeroUsize::new(num_threads) {
         Some(n) => n,
@@ -119,6 +138,7 @@ struct ProcessedArgs {
     index_file: PathBuf,
     clean: bool,
     commit: Option<String>,
+    name: String,
     num_threads: NonZeroUsize,
     log_content_hashes: bool,
 }
@@ -127,6 +147,7 @@ impl ProcessedArgs {
     fn process(args: Args) -> Result<Self> {
         let project_root = project_root(args.project_root)?;
         let index_file = index_file(args.index_file, &project_root)?;
+        let name = name(args.name, &project_root);
         let num_threads = num_threads(args.num_threads)?;
 
         Ok(Self {
@@ -134,6 +155,7 @@ impl ProcessedArgs {
             index_file,
             clean: args.clean,
             commit: args.commit,
+            name,
             num_threads,
             log_content_hashes: args.log_content_hashes,
         })
@@ -229,9 +251,9 @@ fn main() -> anyhow::Result<()> {
                     let content = std::str::from_utf8(&content)?;
                     let res = StackGraphCtx::build(&content, &key.filename);
 
-                    if res.is_err() {
-                        log::warn!("Failed to build stack graph for {}", &key_name);
-                    }
+                    // if res.is_err() {
+                    //     log::warn!("Failed to build stack graph for {}", &key_name);
+                    // }
 
                     store.save(&key, res.map_err(|err| err.to_string()))?;
                     bar.inc(1);
@@ -269,14 +291,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("Resolving all references...");
-    let deps = resolve(&mut ctx).into_iter().collect::<HashSet<_>>();
+    let deps = resolve(&mut ctx);
+    let matrix = Dv8Matrix::build(
+        &cli.name,
+        deps,
+        failures.keys().map(|k| k.filename.to_string()).collect(),
+    );
 
     log::info!("Writing output...");
-    for (src, tgt) in deps.iter().sorted() {
-        if src != tgt {
-            println!("{} -> {}", src, tgt);
-        }
-    }
+    let text = serde_json::to_string_pretty(&matrix)?;
+    println!("{}", text);
 
     log::info!("Finished in {}ms.", start.elapsed().as_millis());
     Ok(())

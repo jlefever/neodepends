@@ -1039,6 +1039,8 @@ dependencies = [
  "itertools 0.12.0",
  "log",
  "rusqlite",
+ "serde",
+ "serde_json",
  "stack-graphs",
  "tree-sitter-graph",
  "tree-sitter-stack-graphs",

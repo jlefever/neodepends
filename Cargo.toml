@@ -31,3 +31,5 @@ itertools = "0.12.0"
 indicatif = { version = "0.17.7", features = ["improved_unicode"] }
 indicatif-log-bridge = "0.2.2"
 clap-verbosity-flag = "2.1.2"
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.111"
