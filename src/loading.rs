@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -14,6 +15,7 @@ use git2::TreeWalkResult;
 use walkdir::WalkDir;
 
 use crate::core::FileKey;
+use crate::languages::Lang;
 
 pub enum FileSystem {
     Disk { root: PathBuf },
@@ -54,10 +56,10 @@ impl FileSystem {
         })
     }
 
-    pub fn ls(&self) -> Result<Vec<FileKey>> {
+    pub fn ls(&self, langs: &HashSet<Lang>) -> Result<Vec<FileKey>> {
         match &self {
-            FileSystem::Disk { root } => ls_disk(root),
-            FileSystem::Git { repo, commit } => ls_git(&repo, &commit),
+            FileSystem::Disk { root } => ls_disk(root, langs),
+            FileSystem::Git { repo, commit } => ls_git(&repo, &commit, langs),
         }
     }
 
@@ -69,7 +71,13 @@ impl FileSystem {
     }
 }
 
-fn ls_disk<P: AsRef<Path>>(root: P) -> Result<Vec<FileKey>> {
+fn supported(filename: &str, langs: &HashSet<Lang>) -> bool {
+    Lang::from_filename(filename)
+        .map(|l| langs.contains(&l))
+        .is_some()
+}
+
+fn ls_disk<P: AsRef<Path>>(root: P, langs: &HashSet<Lang>) -> Result<Vec<FileKey>> {
     let mut keys = Vec::new();
 
     for entry in WalkDir::new(&root).follow_links(true) {
@@ -81,7 +89,7 @@ fn ls_disk<P: AsRef<Path>>(root: P) -> Result<Vec<FileKey>> {
                     .to_string_lossy()
                     .to_string();
 
-                if path.ends_with(".java") {
+                if supported(&path, langs) {
                     let content_hash = Oid::hash_file(ObjectType::Blob, &path)?;
                     keys.push(FileKey::new(path, content_hash));
                 }
@@ -95,7 +103,11 @@ fn ls_disk<P: AsRef<Path>>(root: P) -> Result<Vec<FileKey>> {
     Ok(keys)
 }
 
-fn ls_git<S: AsRef<str>>(repo: &Repository, commit: S) -> Result<Vec<FileKey>> {
+fn ls_git<S: AsRef<str>>(
+    repo: &Repository,
+    commit: S,
+    langs: &HashSet<Lang>,
+) -> Result<Vec<FileKey>> {
     let mut keys = Vec::new();
 
     parse_commit(repo, commit)?
@@ -103,7 +115,7 @@ fn ls_git<S: AsRef<str>>(repo: &Repository, commit: S) -> Result<Vec<FileKey>> {
         .walk(TreeWalkMode::PreOrder, |dir, entry| {
             let path = dir.to_string() + entry.name().unwrap();
 
-            if path.ends_with(".java") {
+            if supported(&path, langs) {
                 keys.push(FileKey::new(path, entry.id()));
             }
 

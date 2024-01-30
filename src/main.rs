@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use clap::ValueEnum;
 use clap_verbosity_flag::InfoLevel;
 use clap_verbosity_flag::Verbosity;
 use indicatif::MultiProgress;
@@ -20,6 +22,7 @@ use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
 
 use crate::dv8::Dv8Matrix;
+use crate::languages::Lang;
 use crate::loading::FileSystem;
 use crate::resolution::resolve;
 use crate::resolution::StackGraphCtx;
@@ -28,8 +31,10 @@ use crate::storage::Store;
 
 mod core;
 mod dv8;
+mod languages;
 mod loading;
 mod resolution;
+mod sparse_vec;
 mod storage;
 
 const DEFAULT_INDEX_FILE: &str = ".neodepends.db";
@@ -61,9 +66,13 @@ struct Args {
     #[arg(short, long)]
     index_file: Option<PathBuf>,
 
-    /// Delete the index before scanning.
+    /// Delete the index before scanning
     #[arg(long)]
     clean: bool,
+
+    /// Enable the provided langauges
+    #[arg(short, long, value_delimiter = ' ', default_values_t = EnabledLang::all())]
+    langs: Vec<EnabledLang>,
 
     /// A commit to scan instead of the files on disk
     ///
@@ -91,6 +100,48 @@ struct Args {
 
     #[command(flatten)]
     verbose: Verbosity<InfoLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+enum EnabledLang {
+    Java,
+    JavaScript,
+    Python,
+    TypeScript,
+}
+
+impl EnabledLang {
+    fn all() -> &'static [EnabledLang] {
+        &[
+            EnabledLang::Java,
+            EnabledLang::JavaScript,
+            EnabledLang::Python,
+            EnabledLang::TypeScript,
+        ]
+    }
+}
+
+impl Display for EnabledLang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnabledLang::Java => write!(f, "java"),
+            EnabledLang::JavaScript => write!(f, "javascript"),
+            EnabledLang::Python => write!(f, "python"),
+            EnabledLang::TypeScript => write!(f, "typescript"),
+        }
+    }
+}
+
+impl From<EnabledLang> for Lang {
+    fn from(value: EnabledLang) -> Self {
+        match value {
+            EnabledLang::Java => Lang::Java,
+            EnabledLang::JavaScript => Lang::JavaScript,
+            EnabledLang::Python => Lang::Python,
+            EnabledLang::TypeScript => Lang::TypeScript,
+        }
+    }
 }
 
 fn project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -137,6 +188,7 @@ struct ProcessedArgs {
     project_root: PathBuf,
     index_file: PathBuf,
     clean: bool,
+    langs: HashSet<Lang>,
     commit: Option<String>,
     name: String,
     num_threads: NonZeroUsize,
@@ -154,6 +206,7 @@ impl ProcessedArgs {
             project_root,
             index_file,
             clean: args.clean,
+            langs: args.langs.into_iter().map_into().collect(),
             commit: args.commit,
             name,
             num_threads,
@@ -211,7 +264,7 @@ fn main() -> anyhow::Result<()> {
     let start = Instant::now();
 
     let fs = FileSystem::open(&cli.project_root, &cli.commit)?;
-    let keys = fs.ls()?;
+    let keys = fs.ls(&cli.langs)?;
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
     let store = Store::open(&cli.index_file)?;

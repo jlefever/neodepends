@@ -10,6 +10,8 @@ use tree_sitter_graph::Variables;
 use tree_sitter_stack_graphs::BuildError;
 use tree_sitter_stack_graphs::NoCancellation;
 
+use crate::languages::Lang;
+
 static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
 pub struct StackGraphCtx {
@@ -34,8 +36,7 @@ impl StackGraphCtx {
 
         let file = graph.get_or_create_file(filename);
 
-        // TODO: Select the config using Loader from tree_sitter_stack_graphs
-        let config = tree_sitter_stack_graphs_java::language_configuration(&NoCancellation);
+        let config = Lang::from_filename(filename).unwrap().config();
 
         config.sgl.build_stack_graph_into(
             &mut graph,

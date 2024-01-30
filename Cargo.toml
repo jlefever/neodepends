@@ -15,6 +15,7 @@ stack-graphs = { path = "thirdparty/stack-graphs/stack-graphs" }
 tree-sitter-stack-graphs = { path = "thirdparty/stack-graphs/tree-sitter-stack-graphs" }
 tree-sitter-stack-graphs-java = { path = "thirdparty/stack-graphs/languages/tree-sitter-stack-graphs-java" }
 tree-sitter-stack-graphs-javascript = { path = "thirdparty/stack-graphs/languages/tree-sitter-stack-graphs-javascript" }
+tree-sitter-stack-graphs-python = { path = "thirdparty/stack-graphs/languages/tree-sitter-stack-graphs-python" }
 tree-sitter-stack-graphs-typescript = { path = "thirdparty/stack-graphs/languages/tree-sitter-stack-graphs-typescript" }
 
 # Dependencies from crates.io
@@ -33,3 +34,4 @@ indicatif-log-bridge = "0.2.2"
 clap-verbosity-flag = "2.1.2"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
+lazy_static = "1.4.0"
