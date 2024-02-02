@@ -22,11 +22,7 @@ pub struct StackGraphCtx {
 
 impl StackGraphCtx {
     fn new(graph: StackGraph, partials: PartialPaths, paths: Vec<PartialPath>) -> Self {
-        Self {
-            graph,
-            partials,
-            paths,
-        }
+        Self { graph, partials, paths }
     }
 
     pub fn build(source: &str, filename: &str) -> Result<StackGraphCtx, BuildError> {
@@ -36,9 +32,9 @@ impl StackGraphCtx {
 
         let file = graph.get_or_create_file(filename);
 
-        let config = Lang::from_filename(filename).unwrap().config();
+        let lang = Lang::from_filename(filename).unwrap();
 
-        config.sgl.build_stack_graph_into(
+        lang.sg_config().sgl.build_stack_graph_into(
             &mut graph,
             file,
             source,
@@ -138,9 +134,7 @@ pub fn resolve<'a>(ctx: &'a mut StackGraphCtx) -> Vec<(&'a str, &'a str)> {
 
     let _stitching_res = ForwardPartialPathStitcher::find_all_complete_partial_paths(
         &mut DatabaseCandidates::new(&ctx.graph, &mut ctx.partials, &mut db),
-        ctx.graph
-            .iter_nodes()
-            .filter(|&n| ctx.graph[n].is_reference()),
+        ctx.graph.iter_nodes().filter(|&n| ctx.graph[n].is_reference()),
         StitcherConfig::default(),
         &stack_graphs::NoCancellation,
         |_, _, p| {

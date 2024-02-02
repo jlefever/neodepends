@@ -35,3 +35,10 @@ clap-verbosity-flag = "2.1.2"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
 lazy_static = "1.4.0"
+tree-sitter = { version = "0.20.10", features = ["lazy_static"] }
+derive_builder = "0.13.0"
+sha1 = "0.10.6"
+slotmap = { version = "1.0.7", features = ["serde"] }
+derive-new = "0.6.0"
+strum = { version = "0.26.1", features = ["derive"] }
+strum_macros = "0.26"

@@ -1,3 +1,7 @@
+#[macro_use]
+extern crate derive_builder;
+extern crate derive_new;
+
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::num::NonZeroUsize;
@@ -31,6 +35,7 @@ use crate::storage::Store;
 
 mod core;
 mod dv8;
+mod entities;
 mod languages;
 mod loading;
 mod resolution;
