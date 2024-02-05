@@ -4,15 +4,17 @@ extern crate derive_new;
 
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::fs::remove_dir_all;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::thread::available_parallelism;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
@@ -31,7 +33,6 @@ use tabled::settings::Style;
 use tabled::Table;
 use tabled::Tabled;
 use tree_sitter::Point;
-use tree_sitter::Range;
 
 use crate::dv8::Dv8Matrix;
 use crate::languages::Lang;
@@ -50,7 +51,7 @@ mod resolution;
 mod sparse_vec;
 mod storage;
 
-const DEFAULT_INDEX_FILE: &str = ".neodepends.db";
+const DEFAULT_INDEX_PATH: &str = ".neodepends";
 
 /// Scan a project and extract structural dependency information
 ///
@@ -74,10 +75,10 @@ struct Cli {
 
     /// The index to store and retrieve values while scanning
     ///
-    /// Defaults to `.git/.neodepends.db` or `.neodepends.db` if the project
+    /// Defaults to `.git/.neodepends` or `.neodepends` if the project
     /// root is not a git repository. Will be created if not found.
     #[arg(short, long)]
-    index_file: Option<PathBuf>,
+    index_path: Option<PathBuf>,
 
     /// Delete the index before scanning
     #[arg(long)]
@@ -180,11 +181,11 @@ fn project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
     Ok(project_root.unwrap_or(std::env::current_dir()?))
 }
 
-fn index_file<P: AsRef<Path>>(index_file: Option<PathBuf>, project_root: P) -> Result<PathBuf> {
-    Ok(index_file.unwrap_or_else(|| {
+fn index_path<P: AsRef<Path>>(index_path: Option<PathBuf>, project_root: P) -> Result<PathBuf> {
+    Ok(index_path.unwrap_or_else(|| {
         let git_dir = project_root.as_ref().join(".git");
-        let preferred = git_dir.join(DEFAULT_INDEX_FILE);
-        let fallback = project_root.as_ref().join(DEFAULT_INDEX_FILE);
+        let preferred = git_dir.join(DEFAULT_INDEX_PATH);
+        let fallback = project_root.as_ref().join(DEFAULT_INDEX_PATH);
 
         if preferred.exists() {
             preferred
@@ -218,7 +219,7 @@ fn num_threads(num_threads: usize) -> Result<NonZeroUsize> {
 
 struct CommonArgs {
     project_root: PathBuf,
-    index_file: PathBuf,
+    index_path: PathBuf,
     clean: bool,
     langs: HashSet<Lang>,
     num_threads: NonZeroUsize,
@@ -227,12 +228,12 @@ struct CommonArgs {
 impl CommonArgs {
     fn from(cli: &Cli) -> Result<Self> {
         let project_root = project_root(cli.project_root.clone())?;
-        let index_file = index_file(cli.index_file.clone(), &project_root)?;
+        let index_path = index_path(cli.index_path.clone(), &project_root)?;
         let num_threads = num_threads(cli.num_threads)?;
 
         Ok(Self {
             project_root,
-            index_file,
+            index_path,
             clean: cli.clean,
             langs: cli.langs.iter().map_into().collect(),
             num_threads,
@@ -244,33 +245,6 @@ impl CommonArgs {
     }
 }
 
-fn delete_file<P: AsRef<Path>>(path: P) -> Result<()> {
-    let path = path.as_ref();
-
-    if path.exists() {
-        std::fs::remove_file(path)?;
-
-        if path.exists() {
-            bail!("failed to remove {}", path.to_string_lossy());
-        }
-    }
-
-    Ok(())
-}
-
-fn clean<P: AsRef<Path>>(index_file: P) -> Result<()> {
-    let index_file = index_file.as_ref();
-
-    if index_file.exists() {
-        log::info!("Removing existing index file...");
-        delete_file(index_file)?;
-        delete_file(index_file.to_str().unwrap().to_owned() + "-shm")?;
-        delete_file(index_file.to_str().unwrap().to_owned() + "-wal")?;
-    }
-
-    Ok(())
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let logger = env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).build();
@@ -278,8 +252,9 @@ fn main() -> anyhow::Result<()> {
     let multi_progress = MultiProgress::new();
     LogWrapper::new(multi_progress.clone(), logger).try_init().unwrap();
 
-    if args.clean {
-        clean(&args.index_file)?;
+    if args.clean && args.index_path.exists() {
+        log::info!("Removing existing index...");
+        remove_dir_all(&args.index_path)?;
     }
 
     match cli.command {
@@ -291,12 +266,12 @@ fn main() -> anyhow::Result<()> {
 fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::Result<()> {
     let start = Instant::now();
 
-    let fs = FileSystem::open(&args.project_root, &cmd.commit)?;
-    let keys = fs.ls(&args.langs)?;
+    let fs = Arc::new(Mutex::new(FileSystem::open(&args.project_root, &cmd.commit)?));
+    let keys = fs.lock().unwrap().ls(&args.langs)?;
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
-    let store = Store::open(&args.index_file)?;
-    let missing = store.find_missing(&keys)?;
+    let store = Arc::new(Mutex::new(Store::open(&args.index_path)?));
+    let missing = store.lock().unwrap().find_missing(&keys);
 
     if missing.len() > 0 {
         log::info!("Processing {} file(s) which were not found in index...", missing.len());
@@ -311,21 +286,17 @@ fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::
 
         for chunk in &missing.into_iter().chunks(num_per_thread) {
             let chunk = chunk.collect::<Vec<_>>();
-            let project_root = args.project_root.clone();
-            let index_file = args.index_file.clone();
-            let commit = cmd.commit.clone();
+            let fs = fs.clone();
+            let store = store.clone();
             let bar = bar.clone();
 
             handles.push(thread::spawn(move || {
-                let fs = FileSystem::open(project_root, &commit)?;
-                let store = Store::open(index_file)?;
-
                 for key in &chunk {
                     let key_name = key.to_string(cmd.log_content_hashes);
                     let msg = format!("Processing {}...", &key_name);
                     log::debug!("{}", msg);
                     bar.set_message(msg);
-                    let content = fs.load_file(key)?;
+                    let content = fs.lock().unwrap().load_file(key)?;
                     let content = std::str::from_utf8(&content)?;
                     let res = StackGraphCtx::build(&content, &key.filename);
 
@@ -333,7 +304,7 @@ fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::
                     //     log::warn!("Failed to build stack graph for {}", &key_name);
                     // }
 
-                    store.save(&key, res.map_err(|err| err.to_string()))?;
+                    store.lock().unwrap().save(&key, res.ok())?;
                     bar.inc(1);
                 }
 
@@ -350,14 +321,14 @@ fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::
     }
 
     log::info!("Loading stack graphs for all {} files...", keys.len());
-    let LoadResponse { mut ctx, failures } = store.load(&keys)?;
+    let LoadResponse { mut ctx, failures } = store.lock().unwrap().load(&keys)?;
 
     if failures.len() > 0 {
         log::warn!(
             "The following {} files have failed to be built into stack graphs and therefore will \
              not be considered during dependency resolution:\n{}",
             failures.len(),
-            failures.keys().sorted().map(|k| k.to_string(cmd.log_content_hashes)).join("\n")
+            failures.iter().sorted().map(|k| k.to_string(cmd.log_content_hashes)).join("\n")
         );
     }
 
@@ -366,7 +337,7 @@ fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::
     let matrix = Dv8Matrix::build(
         name(cmd.name, &args.project_root),
         deps,
-        failures.keys().map(|k| k.filename.to_string()).collect(),
+        failures.iter().map(|k| k.filename.to_string()).collect(),
     );
 
     log::info!("Writing output...");
