@@ -41,10 +41,10 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    pub fn to_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
             EntityKind::File => "file",
-            EntityKind::LangSpecific(e) => e.to_str(),
+            EntityKind::LangSpecific(e) => e.as_str(),
         }
     }
 }
@@ -55,7 +55,7 @@ pub enum LangSpecificEntityKind {
 }
 
 impl LangSpecificEntityKind {
-    pub fn to_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
             LangSpecificEntityKind::Java(e) => e.as_ref(),
         }
@@ -90,8 +90,17 @@ impl EntityId {
         let mut hasher = Sha1::new();
         parent_id.map(|p| hasher.update(p.as_bytes()));
         hasher.update(name.as_bytes());
-        hasher.update(kind.to_str().as_bytes());
+        hasher.update(kind.as_str().as_bytes());
         Self(hasher.finalize().into())
+    }
+
+    pub fn to_string(&self) -> String {
+        hex::encode(self.0)   
+    }
+
+    pub fn to_short_string(&self) -> String {
+        let text = self.to_string();
+        text[33..text.len()].to_string()
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -105,18 +114,19 @@ impl EntityId {
 
 #[derive(Debug, Clone, PartialEq, Eq, new)]
 pub struct Entity {
-    id: EntityId,
-    parent_id: Option<EntityId>,
-    name: String,
-    kind: EntityKind,
+    pub id: EntityId,
+    pub parent_id: Option<EntityId>,
+    pub name: String,
+    pub kind: EntityKind,
+    pub range: Range, // ???
 }
 
 pub struct EntityContainer {
-    entities: HashMap<EntityId, Entity>,
-    locations: SparseVec<EntityId>,
+    pub entities: Vec<Entity>,
+    pub locations: SparseVec<EntityId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Builder, new)]
+#[derive(Debug, Clone, PartialEq, Eq, Builder)]
 struct Tag {
     id: usize,
     parent_id: Option<usize>,
@@ -157,7 +167,7 @@ impl EntityExtractor {
         Self { language, query, kinds, name }
     }
 
-    fn extract(&self, source: &[u8], filename: &str) -> Result<EntityContainer> {
+    pub fn extract(&self, source: &[u8], filename: &str) -> Result<EntityContainer> {
         let mut parser = Parser::new();
         parser.set_language(self.language)?;
         let tree = parser.parse(source, None).context("failed to parse")?;
@@ -170,6 +180,7 @@ impl EntityExtractor {
         // Create a tag for each match
         for r#match in cursor.matches(&self.query, root, source) {
             let mut builder: TagBuilder = TagBuilder::default();
+            builder.parent_id(None);
 
             for capture in r#match.captures {
                 if capture.index == self.name {
@@ -225,12 +236,13 @@ impl EntityExtractor {
         // Convert to entities
         let entities = tags
             .into_values()
+            .sorted_by_key(|t| (t.ancestor_ids.len(), t.range.start_byte))
             .map(|t| {
                 let id = *ids.get(&t.id).unwrap();
                 let parent_id = t.parent_id.map(|p| *ids.get(&p).unwrap());
-                (id, Entity::new(id, parent_id, t.name, t.kind))
+                Entity::new(id, parent_id, t.name, t.kind, t.range)
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<Vec<_>>();
 
         EntityContainer { entities, locations }
     }

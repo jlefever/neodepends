@@ -15,15 +15,23 @@ use std::time::Instant;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use clap::Args;
 use clap::Parser;
+use clap::Subcommand;
 use clap::ValueEnum;
 use clap_verbosity_flag::InfoLevel;
 use clap_verbosity_flag::Verbosity;
+use entities::get_entity_extractor;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
+use tabled::settings::Style;
+use tabled::Table;
+use tabled::Tabled;
+use tree_sitter::Point;
+use tree_sitter::Range;
 
 use crate::dv8::Dv8Matrix;
 use crate::languages::Lang;
@@ -57,7 +65,7 @@ const DEFAULT_INDEX_FILE: &str = ".neodepends.db";
 /// change).
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
-struct Args {
+struct Cli {
     /// The root of the project to scan
     ///
     /// Defaults to the current working directory.
@@ -79,6 +87,29 @@ struct Args {
     #[arg(short, long, value_delimiter = ' ', default_values_t = EnabledLang::all())]
     langs: Vec<EnabledLang>,
 
+    /// Number of threads to use when processing files
+    ///
+    /// If 0, this will be set automatically (typically as the number of CPU
+    /// cores)
+    #[arg(short, long, default_value_t = 0)]
+    num_threads: usize,
+
+    #[command(flatten)]
+    verbose: Verbosity<InfoLevel>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Dump(DumpCommand),
+    LsEntities(LsEntitiesCommand),
+}
+
+/// Export files and dependencies as DV8 JSON
+#[derive(Debug, Args)]
+struct DumpCommand {
     /// A commit to scan instead of the files on disk
     ///
     /// If not specified, will scan recursively from the project root. Can be a
@@ -92,19 +123,20 @@ struct Args {
     #[arg(long)]
     name: Option<String>,
 
-    /// Number of threads to use when processing files
-    ///
-    /// If 0, this will be set automatically (typically as the number of CPU
-    /// cores)
-    #[arg(short, long, default_value_t = 0)]
-    num_threads: usize,
-
     /// Include the hashes of file contents (i.e. blobs) in the log output
     #[arg(long)]
     log_content_hashes: bool,
+}
 
-    #[command(flatten)]
-    verbose: Verbosity<InfoLevel>,
+/// List all entities found
+#[derive(Debug, Args)]
+struct LsEntitiesCommand {
+    /// Pull entities from this commit instead of disk
+    ///
+    /// If not specified, will scan recursively from the project root. Can be a
+    /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
+    #[arg(long)]
+    commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -118,12 +150,7 @@ enum EnabledLang {
 
 impl EnabledLang {
     fn all() -> &'static [EnabledLang] {
-        &[
-            EnabledLang::Java,
-            EnabledLang::JavaScript,
-            EnabledLang::Python,
-            EnabledLang::TypeScript,
-        ]
+        &[EnabledLang::Java, EnabledLang::JavaScript, EnabledLang::Python, EnabledLang::TypeScript]
     }
 }
 
@@ -138,8 +165,8 @@ impl Display for EnabledLang {
     }
 }
 
-impl From<EnabledLang> for Lang {
-    fn from(value: EnabledLang) -> Self {
+impl From<&EnabledLang> for Lang {
+    fn from(value: &EnabledLang) -> Self {
         match value {
             EnabledLang::Java => Lang::Java,
             EnabledLang::JavaScript => Lang::JavaScript,
@@ -189,33 +216,26 @@ fn num_threads(num_threads: usize) -> Result<NonZeroUsize> {
     })
 }
 
-struct ProcessedArgs {
+struct CommonArgs {
     project_root: PathBuf,
     index_file: PathBuf,
     clean: bool,
     langs: HashSet<Lang>,
-    commit: Option<String>,
-    name: String,
     num_threads: NonZeroUsize,
-    log_content_hashes: bool,
 }
 
-impl ProcessedArgs {
-    fn process(args: Args) -> Result<Self> {
-        let project_root = project_root(args.project_root)?;
-        let index_file = index_file(args.index_file, &project_root)?;
-        let name = name(args.name, &project_root);
-        let num_threads = num_threads(args.num_threads)?;
+impl CommonArgs {
+    fn from(cli: &Cli) -> Result<Self> {
+        let project_root = project_root(cli.project_root.clone())?;
+        let index_file = index_file(cli.index_file.clone(), &project_root)?;
+        let num_threads = num_threads(cli.num_threads)?;
 
         Ok(Self {
             project_root,
             index_file,
-            clean: args.clean,
-            langs: args.langs.into_iter().map_into().collect(),
-            commit: args.commit,
-            name,
+            clean: cli.clean,
+            langs: cli.langs.iter().map_into().collect(),
             num_threads,
-            log_content_hashes: args.log_content_hashes,
         })
     }
 
@@ -252,48 +272,48 @@ fn clean<P: AsRef<Path>>(index_file: P) -> Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Args::parse();
-    let logger = env_logger::Builder::new()
-        .filter_level(cli.verbose.log_level_filter())
-        .build();
-    let cli = ProcessedArgs::process(cli)?;
+    let cli = Cli::parse();
+    let logger = env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).build();
+    let args = CommonArgs::from(&cli)?;
     let multi_progress = MultiProgress::new();
-    LogWrapper::new(multi_progress.clone(), logger)
-        .try_init()
-        .unwrap();
+    LogWrapper::new(multi_progress.clone(), logger).try_init().unwrap();
 
-    if cli.clean {
-        clean(&cli.index_file)?;
+    if args.clean {
+        clean(&args.index_file)?;
     }
 
+    match cli.command {
+        Command::Dump(cmd) => dump(args, cmd, multi_progress),
+        Command::LsEntities(cmd) => ls_entities(args, cmd),
+    }
+}
+
+fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::Result<()> {
     let start = Instant::now();
 
-    let fs = FileSystem::open(&cli.project_root, &cli.commit)?;
-    let keys = fs.ls(&cli.langs)?;
+    let fs = FileSystem::open(&args.project_root, &cmd.commit)?;
+    let keys = fs.ls(&args.langs)?;
     log::info!("Found {} file(s) at the selected commit.", keys.len());
 
-    let store = Store::open(&cli.index_file)?;
+    let store = Store::open(&args.index_file)?;
     let missing = store.find_missing(&keys)?;
 
     if missing.len() > 0 {
-        log::info!(
-            "Processing {} file(s) which were not found in index...",
-            missing.len()
-        );
-        let bar = multi_progress
-            .add(ProgressBar::new(missing.len() as u64))
-            .with_style(ProgressStyle::with_template(
+        log::info!("Processing {} file(s) which were not found in index...", missing.len());
+        let bar = progress.add(ProgressBar::new(missing.len() as u64)).with_style(
+            ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:40} {pos}/{len} (ETA: {eta_precise}) {msg}",
-            )?);
+            )?,
+        );
 
         let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
-        let num_per_thread = cli.num_per_thread(missing.len());
+        let num_per_thread = args.num_per_thread(missing.len());
 
         for chunk in &missing.into_iter().chunks(num_per_thread) {
             let chunk = chunk.collect::<Vec<_>>();
-            let project_root = cli.project_root.clone();
-            let index_file = cli.index_file.clone();
-            let commit = cli.commit.clone();
+            let project_root = args.project_root.clone();
+            let index_file = args.index_file.clone();
+            let commit = cmd.commit.clone();
             let bar = bar.clone();
 
             handles.push(thread::spawn(move || {
@@ -301,7 +321,7 @@ fn main() -> anyhow::Result<()> {
                 let store = Store::open(index_file)?;
 
                 for key in &chunk {
-                    let key_name = key.to_string(cli.log_content_hashes);
+                    let key_name = key.to_string(cmd.log_content_hashes);
                     let msg = format!("Processing {}...", &key_name);
                     log::debug!("{}", msg);
                     bar.set_message(msg);
@@ -322,14 +342,11 @@ fn main() -> anyhow::Result<()> {
         }
 
         for handle in handles {
-            handle
-                .join()
-                .expect("could not join thread")
-                .context("error in thread")?;
+            handle.join().expect("could not join thread").context("error in thread")?;
         }
 
         bar.finish();
-        multi_progress.remove(&bar);
+        progress.remove(&bar);
     }
 
     log::info!("Loading stack graphs for all {} files...", keys.len());
@@ -340,18 +357,14 @@ fn main() -> anyhow::Result<()> {
             "The following {} files have failed to be built into stack graphs and therefore will \
              not be considered during dependency resolution:\n{}",
             failures.len(),
-            failures
-                .keys()
-                .sorted()
-                .map(|k| k.to_string(cli.log_content_hashes))
-                .join("\n")
+            failures.keys().sorted().map(|k| k.to_string(cmd.log_content_hashes)).join("\n")
         );
     }
 
     log::info!("Resolving all references...");
     let deps = resolve(&mut ctx);
     let matrix = Dv8Matrix::build(
-        &cli.name,
+        name(cmd.name, &args.project_root),
         deps,
         failures.keys().map(|k| k.filename.to_string()).collect(),
     );
@@ -361,5 +374,54 @@ fn main() -> anyhow::Result<()> {
     println!("{}", text);
 
     log::info!("Finished in {}ms.", start.elapsed().as_millis());
+    Ok(())
+}
+
+#[derive(Tabled)]
+struct EntityRow {
+    id: String,
+    parent_id: String,
+    kind: String,
+    name: String,
+    start: Point,
+    end: Point,
+}
+
+fn ls_entities(args: CommonArgs, cmd: LsEntitiesCommand) -> anyhow::Result<()> {
+    let fs = FileSystem::open(&args.project_root, &cmd.commit)?;
+    let keys = fs.ls(&args.langs)?;
+
+    let mut rows = vec![];
+
+    for key in &keys {
+        let extractor = Lang::from_filename(&key.filename).and_then(|l| get_entity_extractor(l));
+
+        if extractor.is_none() {
+            continue;
+        }
+
+        let extractor = extractor.unwrap();
+        let content = fs.load_file(key)?;
+        let entities = extractor.extract(&content, &key.filename);
+
+        if let Err(err) = entities {
+            println!("{:#?}", err);
+            continue;
+        }
+
+        rows.extend(entities.unwrap().entities.iter().map(|e| EntityRow {
+            id: e.id.to_short_string(),
+            parent_id: e.parent_id.map(|p| p.to_short_string()).unwrap_or("".to_string()),
+            kind: e.kind.as_str().to_string(),
+            name: e.name.to_string(),
+            start: e.range.start_point,
+            end: e.range.end_point,
+        }));
+    }
+
+    let mut table = Table::builder(rows).build();
+    table.with(Style::psql());
+    println!("{}", table);
+
     Ok(())
 }
