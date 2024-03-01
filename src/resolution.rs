@@ -1,3 +1,6 @@
+use ::serde::Serialize;
+use stack_graphs::arena::Handle;
+use stack_graphs::graph::Node;
 use stack_graphs::graph::StackGraph;
 use stack_graphs::partial::PartialPath;
 use stack_graphs::partial::PartialPaths;
@@ -6,10 +9,15 @@ use stack_graphs::stitching::Database;
 use stack_graphs::stitching::DatabaseCandidates;
 use stack_graphs::stitching::ForwardPartialPathStitcher;
 use stack_graphs::stitching::StitcherConfig;
+use strum_macros::AsRefStr;
+use strum_macros::EnumString;
 use tree_sitter_graph::Variables;
 use tree_sitter_stack_graphs::BuildError;
 use tree_sitter_stack_graphs::NoCancellation;
 
+use crate::core::EntityId;
+use crate::core::Loc;
+use crate::entities::EntitySet;
 use crate::languages::Lang;
 
 static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
@@ -123,7 +131,59 @@ impl StackGraphCtx {
     }
 }
 
-pub fn resolve<'a>(ctx: &'a mut StackGraphCtx) -> Vec<(&'a str, &'a str)> {
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, EnumString, AsRefStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum DepKind {
+    Use,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileEndpoint {
+    pub filename: String,
+    pub byte: usize,
+}
+
+impl FileEndpoint {
+    pub fn new(filename: String, byte: usize) -> Self {
+        Self { filename, byte }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Dep<E> {
+    pub src: E,
+    pub tgt: E,
+    pub kind: DepKind,
+    pub byte: usize,
+}
+
+impl<E> Dep<E> {
+    pub fn new(src: E, tgt: E, kind: DepKind, byte: usize) -> Self {
+        Self { src, tgt, kind, byte }
+    }
+}
+
+impl<E: Eq> Dep<E> {
+    pub fn is_loop(&self) -> bool {
+        self.src == self.tgt
+    }
+}
+
+pub type FileDep = Dep<FileEndpoint>;
+
+pub type EntityDep = Dep<EntityId>;
+
+impl FileDep {
+    pub fn to_entity_dep(&self, src_set: &EntitySet, tgt_set: &EntitySet) -> EntityDep {
+        let src = src_set.get_by_byte(self.src.byte);
+        let tgt = tgt_set.get_by_byte(self.tgt.byte);
+        Dep::new(src, tgt, self.kind, self.byte)
+    }
+}
+
+pub fn resolve(ctx: &mut StackGraphCtx) -> Vec<FileDep> {
     let mut references = Vec::new();
 
     let mut db = Database::new();
@@ -142,12 +202,18 @@ pub fn resolve<'a>(ctx: &'a mut StackGraphCtx) -> Vec<(&'a str, &'a str)> {
         },
     );
 
+    let filename = |n: Handle<Node>| ctx.graph[ctx.graph[n].file().unwrap()].name().to_string();
+    let byte = |n: Handle<Node>| Loc::from_span(&ctx.graph.source_info(n).unwrap().span).start_byte;
+
     references
         .iter()
         .map(|r| {
-            let src_file = ctx.graph[ctx.graph[r.start_node].file().unwrap()].name();
-            let tgt_file = ctx.graph[ctx.graph[r.end_node].file().unwrap()].name();
-            (src_file, tgt_file)
+            Dep::new(
+                FileEndpoint::new(filename(r.start_node), byte(r.start_node)),
+                FileEndpoint::new(filename(r.end_node), byte(r.end_node)),
+                DepKind::Use,
+                byte(r.start_node),
+            )
         })
         .collect()
 }

@@ -11,6 +11,7 @@ edition = "2021"
 
 [dependencies]
 # Add stack-graphs dependencies using a submodule because we want the most up-to-date version
+lsp-positions = { path = "thirdparty/stack-graphs/lsp-positions" }
 stack-graphs = { path = "thirdparty/stack-graphs/stack-graphs" }
 tree-sitter-stack-graphs = { path = "thirdparty/stack-graphs/tree-sitter-stack-graphs" }
 tree-sitter-stack-graphs-java = { path = "thirdparty/stack-graphs/languages/tree-sitter-stack-graphs-java" }
@@ -38,9 +39,7 @@ tree-sitter = { version = "0.20.10", features = ["lazy_static"] }
 derive_builder = "0.13.0"
 sha1 = "0.10.6"
 slotmap = { version = "1.0.7", features = ["serde"] }
-derive-new = "0.6.0"
 strum = { version = "0.26.1", features = ["derive"] }
 strum_macros = "0.26"
 hex = "0.4"
-tabled = "0.15.0"
 rocksdb = "0.21.0"

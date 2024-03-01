@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt::Display;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use derive_new::new;
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use sha1::Digest;
-use sha1::Sha1;
+use serde::Serialize;
+use serde::Serializer;
 use strum_macros::AsRefStr;
 use strum_macros::EnumString;
 use tree_sitter::Language;
@@ -14,8 +16,10 @@ use tree_sitter::Node;
 use tree_sitter::Parser;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
-use tree_sitter::Range;
 
+use crate::core::EntityId;
+use crate::core::Loc;
+use crate::core::Sha1Hash;
 use crate::languages::Lang;
 use crate::sparse_vec::SparseVec;
 
@@ -34,7 +38,31 @@ pub fn get_entity_extractor(lang: Lang) -> Option<&'static EntityExtractor> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl EntityId {
+    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind) -> Self {
+        let mut bytes = Vec::new();
+        parent_id.map(|p| bytes.extend(p.as_bytes()));
+        bytes.extend(name.as_bytes());
+        bytes.extend(kind.as_str().as_bytes());
+        Self::from(Sha1Hash::hash(&bytes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Entity {
+    pub id: EntityId,
+    pub parent_id: Option<EntityId>,
+    pub name: String,
+    pub kind: EntityKind,
+}
+
+impl Entity {
+    fn new(id: EntityId, parent_id: Option<EntityId>, name: String, kind: EntityKind) -> Self {
+        Self { id, parent_id, name, kind }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntityKind {
     File,
     LangSpecific(LangSpecificEntityKind),
@@ -49,7 +77,19 @@ impl EntityKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Display for EntityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl Serialize for EntityKind {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LangSpecificEntityKind {
     Java(JavaEntityKind),
 }
@@ -62,7 +102,7 @@ impl LangSpecificEntityKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum JavaEntityKind {
     Annotation,
@@ -82,63 +122,106 @@ impl From<JavaEntityKind> for LangSpecificEntityKind {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EntityId([u8; 20]);
+pub struct EntitySet {
+    file_id: EntityId,
+    entities: HashMap<EntityId, Entity>,
+    locations: HashMap<EntityId, Vec<Loc>>,
+    byte_table: SparseVec<EntityId>,
+    ordered_ids: Vec<EntityId>,
+}
 
-impl EntityId {
-    pub fn from(name: &str, kind: EntityKind, parent_id: Option<EntityId>) -> Self {
-        let mut hasher = Sha1::new();
-        parent_id.map(|p| hasher.update(p.as_bytes()));
-        hasher.update(name.as_bytes());
-        hasher.update(kind.as_str().as_bytes());
-        Self(hasher.finalize().into())
+impl EntitySet {
+    #[allow(dead_code)]
+    pub fn file_id(&self) -> EntityId {
+        self.file_id
     }
 
-    pub fn to_string(&self) -> String {
-        hex::encode(self.0)   
+    #[allow(dead_code)]
+    pub fn filename(&self) -> &str {
+        &self.entities.get(&self.file_id).unwrap().name
     }
 
-    pub fn to_short_string(&self) -> String {
-        let text = self.to_string();
-        text[33..text.len()].to_string()
+    pub fn entities(&self) -> impl IntoIterator<Item = &Entity> {
+        self.ordered_ids.iter().map(|id| &self.entities[id])
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    pub fn get_locations_for(&self, id: EntityId) -> &[Loc] {
+        &self.locations.get(&id).unwrap()
     }
 
-    pub fn into_bytes(self) -> [u8; 20] {
-        self.0
+    pub fn get_by_byte(&self, byte: usize) -> EntityId {
+        self.byte_table.get(byte).unwrap_or(self.file_id)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, new)]
-pub struct Entity {
-    pub id: EntityId,
-    pub parent_id: Option<EntityId>,
-    pub name: String,
-    pub kind: EntityKind,
-    pub range: Range, // ???
+impl EntitySet {
+    // Must be in topological order
+    fn from_topo_vec(pairs: Vec<(Entity, Loc)>) -> Result<Self> {
+        let mut file_id = None;
+        let mut entities = HashMap::with_capacity(pairs.len());
+        let mut locations: HashMap<EntityId, Vec<Loc>> = HashMap::with_capacity(pairs.len());
+        let mut byte_table = SparseVec::with_capacity(pairs.len());
+        let mut ordered_ids = Vec::with_capacity(pairs.len());
+
+        for (entity, loc) in pairs {
+            if matches!(entity.kind, EntityKind::File) {
+                if file_id.is_none() {
+                    file_id = Some(entity.id);
+                } else {
+                    bail!("entity set cannot contain more than one file");
+                }
+            }
+
+            if let Some(parent_id) = entity.parent_id {
+                if !entities.contains_key(&parent_id) {
+                    bail!("pairs must be sorted in topological order")
+                }
+            }
+
+            if let Some(locs) = locations.get_mut(&entity.id) {
+                locs.push(loc.clone());
+            } else {
+                locations.insert(entity.id, vec![loc.clone()]);
+            }
+
+            byte_table.insert_many(loc.start_byte, loc.end_byte, entity.id);
+            ordered_ids.push(entity.id);
+            entities.insert(entity.id, entity);
+        }
+
+        if let Some(file_id) = file_id {
+            Ok(EntitySet { file_id, entities, locations, byte_table, ordered_ids })
+        } else {
+            bail!("entity set must contain exactly one file")
+        }
+    }
 }
 
-pub struct EntityContainer {
-    pub entities: Vec<Entity>,
-    pub locations: SparseVec<EntityId>,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TagId(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Builder)]
 struct Tag {
-    id: usize,
-    parent_id: Option<usize>,
-    ancestor_ids: Vec<usize>,
+    id: TagId,
+    ancestor_ids: Vec<TagId>,
     name: String,
     kind: EntityKind,
-    range: Range,
+    location: Loc,
 }
 
 impl Tag {
-    fn file(id: usize, name: String, range: Range) -> Self {
-        Self { id, parent_id: None, ancestor_ids: vec![], name, kind: EntityKind::File, range }
+    fn file(id: TagId, name: String, location: Loc) -> Self {
+        Self { id, ancestor_ids: vec![], name, kind: EntityKind::File, location }
+    }
+
+    fn find_parent_id(&self, tags: &HashSet<TagId>) -> Option<TagId> {
+        for ancestor_id in &self.ancestor_ids {
+            if tags.contains(&ancestor_id) {
+                return Some(*ancestor_id);
+            }
+        }
+
+        None
     }
 }
 
@@ -167,7 +250,7 @@ impl EntityExtractor {
         Self { language, query, kinds, name }
     }
 
-    pub fn extract(&self, source: &[u8], filename: &str) -> Result<EntityContainer> {
+    pub fn extract(&self, source: &[u8], filename: &str) -> Result<EntitySet> {
         let mut parser = Parser::new();
         parser.set_language(self.language)?;
         let tree = parser.parse(source, None).context("failed to parse")?;
@@ -175,21 +258,23 @@ impl EntityExtractor {
         let mut cursor = QueryCursor::new();
 
         let mut tags = HashMap::new();
-        tags.insert(root.id(), Tag::file(root.id(), filename.to_string(), root.range()));
+        tags.insert(
+            TagId(root.id()),
+            Tag::file(TagId(root.id()), filename.to_string(), Loc::from_range(&root.range())),
+        );
 
         // Create a tag for each match
         for r#match in cursor.matches(&self.query, root, source) {
             let mut builder: TagBuilder = TagBuilder::default();
-            builder.parent_id(None);
 
             for capture in r#match.captures {
                 if capture.index == self.name {
                     builder.name(capture.node.utf8_text(source).unwrap().to_string());
                 } else if let Some(tag_kind) = &self.kinds[capture.index as usize] {
-                    builder.id(capture.node.id());
+                    builder.id(TagId(capture.node.id()));
                     builder.kind(EntityKind::LangSpecific(tag_kind.clone()));
-                    builder.range(capture.node.range());
-                    builder.ancestor_ids(Self::get_ancestor_ids(&capture.node));
+                    builder.location(Loc::from_range(&capture.node.range()));
+                    builder.ancestor_ids(collect_ancestor_ids(&capture.node));
                 }
             }
 
@@ -197,65 +282,38 @@ impl EntityExtractor {
             tags.insert(tag.id, tag);
         }
 
-        // Find the parent for each tag
-        let mut parentage = Vec::with_capacity(tags.len());
+        into_entity_set(tags)
+    }
+}
 
-        for tag in tags.values() {
-            for ancestor_id in &tag.ancestor_ids {
-                if let Some(ancestor) = tags.get(ancestor_id) {
-                    parentage.push((tag.id, ancestor.id));
-                    break;
-                }
-            }
-        }
+fn into_entity_set(tags: HashMap<TagId, Tag>) -> Result<EntitySet> {
+    let mut entities = Vec::with_capacity(tags.len());
+    let mut entity_ids = HashMap::with_capacity(tags.len());
+    let tag_ids = tags.keys().map(|&k| k).collect::<HashSet<_>>();
 
-        for (child_id, parent_id) in parentage {
-            tags.get_mut(&child_id).unwrap().parent_id = Some(parent_id);
-        }
+    let mut tags = tags.into_values().collect_vec();
+    tags.sort_by_key(|t| (t.ancestor_ids.len(), t.location));
 
-        Ok(Self::to_file_entity_data(tags))
+    for tag in tags {
+        let parent_tag_id = tag.find_parent_id(&tag_ids);
+        let parent_entity_id = parent_tag_id.map(|id| *entity_ids.get(&id).unwrap());
+        let entity_id = EntityId::new(parent_entity_id, &tag.name, tag.kind);
+        entity_ids.insert(tag.id, entity_id);
+        let entity = Entity::new(entity_id, parent_entity_id, tag.name.clone(), tag.kind);
+        entities.push((entity, tag.location.clone()));
     }
 
-    fn to_file_entity_data(tags: HashMap<usize, Tag>) -> EntityContainer {
-        // Calculate an EntityId for each tag
-        let mut ids = HashMap::new();
+    EntitySet::from_topo_vec(entities)
+}
 
-        for tag in tags.values().sorted_by_key(|t| t.ancestor_ids.len()) {
-            let parent_id = tag.parent_id.map(|p| *ids.get(&p).unwrap());
-            ids.insert(tag.id, EntityId::from(&tag.name, tag.kind, parent_id));
-        }
+fn collect_ancestor_ids(node: &Node) -> Vec<TagId> {
+    let mut ids = Vec::new();
+    let mut curr: Option<Node> = node.parent();
 
-        // Set up locations
-        let mut locations = SparseVec::new();
-
-        for tag in tags.values() {
-            let Range { start_byte, end_byte, .. } = tag.range;
-            locations.insert_many(start_byte, end_byte, *ids.get(&tag.id).unwrap());
-        }
-
-        // Convert to entities
-        let entities = tags
-            .into_values()
-            .sorted_by_key(|t| (t.ancestor_ids.len(), t.range.start_byte))
-            .map(|t| {
-                let id = *ids.get(&t.id).unwrap();
-                let parent_id = t.parent_id.map(|p| *ids.get(&p).unwrap());
-                Entity::new(id, parent_id, t.name, t.kind, t.range)
-            })
-            .collect::<Vec<_>>();
-
-        EntityContainer { entities, locations }
+    while let Some(curr_node) = curr {
+        ids.push(TagId(curr_node.id()));
+        curr = curr_node.parent();
     }
 
-    fn get_ancestor_ids(node: &Node) -> Vec<usize> {
-        let mut ids = Vec::new();
-        let mut curr: Option<Node> = node.parent();
-
-        while let Some(curr_node) = curr {
-            ids.push(curr_node.id());
-            curr = curr_node.parent();
-        }
-
-        ids
-    }
+    ids
 }
