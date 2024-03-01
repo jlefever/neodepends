@@ -4,6 +4,7 @@ extern crate derive_builder;
 use core::EntityId;
 use core::FileDep;
 use core::FileKey;
+use core::Lang;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -35,19 +36,18 @@ use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
 
 use crate::dv8::Dv8Matrix;
-use crate::languages::Lang;
 use crate::loading::FileSystem;
-use crate::resolution::resolve;
-use crate::resolution::StackGraphCtx;
+use crate::stackgraphs::build_stack_graph;
+use crate::stackgraphs::resolve;
+use crate::stackgraphs::StackGraphCtx;
 use crate::storage::LoadResponse;
 use crate::storage::Store;
 
 mod core;
 mod dv8;
 mod entities;
-mod languages;
 mod loading;
-mod resolution;
+mod stackgraphs;
 mod sparse_vec;
 mod storage;
 
@@ -394,8 +394,14 @@ fn collect_deps(
                     bar.set_message(msg);
                     let bytes = fs.load(key)?;
                     let content = std::str::from_utf8(&bytes)?;
-                    let res = StackGraphCtx::build(&content, &key.filename);
-                    store.lock().unwrap().save(&key, res.ok())?;
+                    let res = build_stack_graph(&content, &key.filename);
+
+                    // stackgraphs is not supported for this language
+                    if res.is_none() {
+                        continue;
+                    }
+
+                    store.lock().unwrap().save(&key, res.unwrap().ok())?;
                     bar.inc(1);
                 }
                 Ok(())

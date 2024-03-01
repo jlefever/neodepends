@@ -7,7 +7,7 @@ use itertools::Itertools;
 use rocksdb::DB;
 
 use crate::core::FileKey;
-use crate::resolution::StackGraphCtx;
+use crate::stackgraphs::StackGraphCtx;
 
 static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 

@@ -10,6 +10,30 @@ use sha1::Sha1;
 use strum_macros::AsRefStr;
 use strum_macros::EnumString;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Lang {
+    Java,
+    JavaScript,
+    Python,
+    TypeScript,
+}
+
+impl Lang {
+    pub fn from_ext<S: AsRef<str>>(ext: S) -> Option<Lang> {
+        match ext.as_ref().to_lowercase().as_ref() {
+            "java" => Some(Lang::Java),
+            "js" => Some(Lang::JavaScript),
+            "py" => Some(Lang::Python),
+            "ts" => Some(Lang::TypeScript),
+            _ => None,
+        }
+    }
+
+    pub fn from_filename<S: AsRef<str>>(filename: S) -> Option<Lang> {
+        filename.as_ref().split(".").last().and_then(Self::from_ext)
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, EnumString, AsRefStr,
 )]

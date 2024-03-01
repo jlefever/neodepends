@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 
 use crate::core::ContentId;
 use crate::core::FileKey;
-use crate::languages::Lang;
+use crate::core::Lang;
 
 #[derive(Clone)]
 pub struct FileSystem {

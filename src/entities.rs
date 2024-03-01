@@ -18,16 +18,15 @@ use crate::core::EntityDep;
 use crate::core::EntityId;
 use crate::core::EntityKind;
 use crate::core::FileDep;
+use crate::core::Lang;
 use crate::core::Loc;
-use crate::languages::Lang;
 use crate::loading::FileSystem;
 use crate::sparse_vec::SparseVec;
+use crate::stackgraphs::JAVA_SG;
 
 lazy_static! {
-    static ref JAVA_EXTRACTOR: EntityExtractor = EntityExtractor::new(
-        Lang::Java.sg_config().language,
-        include_str!("../languages/java/tags.scm")
-    );
+    static ref JAVA_EXTRACTOR: EntityExtractor =
+        EntityExtractor::new(JAVA_SG.language(), include_str!("../languages/java/tags.scm"));
 }
 
 pub fn extract(fs: FileSystem, filename: &str) -> Option<EntitySet> {
