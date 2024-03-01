@@ -1,124 +1,44 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt::Display;
 
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use serde::Serialize;
-use serde::Serializer;
-use strum_macros::AsRefStr;
-use strum_macros::EnumString;
 use tree_sitter::Language;
 use tree_sitter::Node;
 use tree_sitter::Parser;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
 
+use crate::core::Dep;
+use crate::core::Entity;
+use crate::core::EntityDep;
 use crate::core::EntityId;
+use crate::core::EntityKind;
+use crate::core::FileDep;
 use crate::core::Loc;
-use crate::core::Sha1Hash;
 use crate::languages::Lang;
+use crate::loading::FileSystem;
 use crate::sparse_vec::SparseVec;
 
 lazy_static! {
     static ref JAVA_EXTRACTOR: EntityExtractor = EntityExtractor::new(
         Lang::Java.sg_config().language,
-        include_str!("../languages/java/tags.scm"),
-        |text| { JavaEntityKind::try_from(text).ok().map(LangSpecificEntityKind::Java) }
+        include_str!("../languages/java/tags.scm")
     );
 }
 
-pub fn get_entity_extractor(lang: Lang) -> Option<&'static EntityExtractor> {
-    match lang {
-        Lang::Java => Some(&JAVA_EXTRACTOR),
+pub fn extract(fs: FileSystem, filename: &str) -> Option<EntitySet> {
+    match Lang::from_filename(filename) {
+        Some(Lang::Java) => {
+            Some(JAVA_EXTRACTOR.extract(&fs.load_by_filename(filename).unwrap(), filename).unwrap())
+        }
+        Some(_) => Some(
+            to_singleton_entity_set(&fs.load_by_filename(filename).unwrap(), filename).unwrap(),
+        ),
         _ => None,
-    }
-}
-
-impl EntityId {
-    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind) -> Self {
-        let mut bytes = Vec::new();
-        parent_id.map(|p| bytes.extend(p.as_bytes()));
-        bytes.extend(name.as_bytes());
-        bytes.extend(kind.as_str().as_bytes());
-        Self::from(Sha1Hash::hash(&bytes))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Entity {
-    pub id: EntityId,
-    pub parent_id: Option<EntityId>,
-    pub name: String,
-    pub kind: EntityKind,
-}
-
-impl Entity {
-    fn new(id: EntityId, parent_id: Option<EntityId>, name: String, kind: EntityKind) -> Self {
-        Self { id, parent_id, name, kind }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EntityKind {
-    File,
-    LangSpecific(LangSpecificEntityKind),
-}
-
-impl EntityKind {
-    pub fn as_str(&self) -> &str {
-        match self {
-            EntityKind::File => "file",
-            EntityKind::LangSpecific(e) => e.as_str(),
-        }
-    }
-}
-
-impl Display for EntityKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl Serialize for EntityKind {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LangSpecificEntityKind {
-    Java(JavaEntityKind),
-}
-
-impl LangSpecificEntityKind {
-    pub fn as_str(&self) -> &str {
-        match self {
-            LangSpecificEntityKind::Java(e) => e.as_ref(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, AsRefStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum JavaEntityKind {
-    Annotation,
-    Constructor,
-    Class,
-    Enum,
-    Field,
-    File,
-    Interface,
-    Method,
-    Record,
-}
-
-impl From<JavaEntityKind> for LangSpecificEntityKind {
-    fn from(value: JavaEntityKind) -> Self {
-        LangSpecificEntityKind::Java(value)
     }
 }
 
@@ -151,6 +71,14 @@ impl EntitySet {
 
     pub fn get_by_byte(&self, byte: usize) -> EntityId {
         self.byte_table.get(byte).unwrap_or(self.file_id)
+    }
+}
+
+impl FileDep {
+    pub fn to_entity_dep(&self, src_set: &EntitySet, tgt_set: &EntitySet) -> EntityDep {
+        let src = src_set.get_by_byte(self.src.byte);
+        let tgt = tgt_set.get_by_byte(self.tgt.byte);
+        Dep::new(src, tgt, self.kind, self.byte)
     }
 }
 
@@ -228,15 +156,12 @@ impl Tag {
 pub struct EntityExtractor {
     language: Language,
     query: Query,
-    kinds: Vec<Option<LangSpecificEntityKind>>,
+    kinds: Vec<Option<EntityKind>>,
     name: u32,
 }
 
 impl EntityExtractor {
-    pub fn new<F>(language: Language, query: &str, parse_kind: F) -> Self
-    where
-        F: Fn(&str) -> Option<LangSpecificEntityKind>,
-    {
+    pub fn new(language: Language, query: &str) -> Self {
         let query = Query::new(language, query.as_ref()).context("failed to parse query").unwrap();
 
         let name = query.capture_index_for_name("name").unwrap();
@@ -244,7 +169,7 @@ impl EntityExtractor {
         let kinds = query
             .capture_names()
             .iter()
-            .map(|c| c.strip_prefix("tag.").map(|x| parse_kind(x).unwrap()))
+            .map(|c| c.strip_prefix("tag.").map(|k| EntityKind::try_from(k).unwrap()))
             .collect::<Vec<_>>();
 
         Self { language, query, kinds, name }
@@ -270,9 +195,9 @@ impl EntityExtractor {
             for capture in r#match.captures {
                 if capture.index == self.name {
                     builder.name(capture.node.utf8_text(source).unwrap().to_string());
-                } else if let Some(tag_kind) = &self.kinds[capture.index as usize] {
+                } else if let Some(kind) = self.kinds[capture.index as usize] {
                     builder.id(TagId(capture.node.id()));
-                    builder.kind(EntityKind::LangSpecific(tag_kind.clone()));
+                    builder.kind(kind);
                     builder.location(Loc::from_range(&capture.node.range()));
                     builder.ancestor_ids(collect_ancestor_ids(&capture.node));
                 }
@@ -284,6 +209,27 @@ impl EntityExtractor {
 
         into_entity_set(tags)
     }
+}
+
+fn to_singleton_entity_set(source: &[u8], filename: &str) -> Result<EntitySet> {
+    let text = String::from_utf8(source.to_vec())?;
+    let mut newlines = Vec::new();
+
+    for (byte, c) in text.char_indices() {
+        if c == '\n' {
+            newlines.push(byte);
+        }
+    }
+
+    let end_byte = source.len() - 1;
+    let end_row = newlines.len();
+    let preceeding_length = newlines.last().map(|last| last + 1).unwrap_or(0);
+    let end_column = source.len() - preceeding_length;
+
+    let mut tags = HashMap::new();
+    let loc = Loc { start_byte: 0, start_row: 0, start_column: 0, end_byte, end_row, end_column };
+    tags.insert(TagId(0), Tag::file(TagId(0), filename.to_string(), loc));
+    into_entity_set(tags)
 }
 
 fn into_entity_set(tags: HashMap<TagId, Tag>) -> Result<EntitySet> {

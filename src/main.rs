@@ -2,6 +2,7 @@
 extern crate derive_builder;
 
 use core::EntityId;
+use core::FileDep;
 use core::FileKey;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -25,21 +26,18 @@ use clap::Subcommand;
 use clap::ValueEnum;
 use clap_verbosity_flag::InfoLevel;
 use clap_verbosity_flag::Verbosity;
-use entities::get_entity_extractor;
+use entities::extract;
 use entities::EntitySet;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
-use resolution::FileDep;
 
-use crate::core::Loc;
 use crate::dv8::Dv8Matrix;
 use crate::languages::Lang;
 use crate::loading::FileSystem;
 use crate::resolution::resolve;
-use crate::resolution::Dep;
 use crate::resolution::StackGraphCtx;
 use crate::storage::LoadResponse;
 use crate::storage::Store;
@@ -337,6 +335,10 @@ fn ls_deps(args: CommonArgs, cmd: LsDepsCommand, progress: MultiProgress) -> any
 
         let dep = dep.to_entity_dep(src_set.unwrap(), tgt_set.unwrap());
 
+        if dep.is_loop() {
+            continue;
+        }
+
         if entity_deps.contains(&dep) {
             println!("{}", serde_json::to_string(&dep)?);
         }
@@ -351,17 +353,7 @@ fn collect_entities(fs: FileSystem) -> HashMap<FileKey, EntitySet> {
     let mut map = HashMap::with_capacity(fs.list().len());
 
     for key in fs.list() {
-        let extractor = Lang::from_filename(&key.filename).and_then(|l| get_entity_extractor(l));
-
-        if extractor.is_none() {
-            // Cannot extract entities from files written in this language ):
-            continue;
-        }
-
-        let extractor = extractor.unwrap();
-        let content = fs.load(key).unwrap();
-
-        if let Ok(entity_set) = extractor.extract(&content, &key.filename) {
+        if let Some(entity_set) = extract(fs.clone(), &key.filename) {
             map.insert(key.clone(), entity_set);
         }
     }

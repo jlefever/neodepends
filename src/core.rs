@@ -7,6 +7,56 @@ use serde::Serialize;
 use serde::Serializer;
 use sha1::Digest;
 use sha1::Sha1;
+use strum_macros::AsRefStr;
+use strum_macros::EnumString;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, EnumString, AsRefStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum EntityKind {
+    File,
+    Annotation,
+    Constructor,
+    Class,
+    Enum,
+    Field,
+    Interface,
+    Method,
+    Record,
+}
+
+impl EntityKind {
+    fn as_str(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+impl Display for EntityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, EnumString, AsRefStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum DepKind {
+    Use,
+}
+
+impl DepKind {
+    fn as_str(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+impl Display for DepKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sha1Hash([u8; 20]);
@@ -62,7 +112,7 @@ impl Serialize for Sha1Hash {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ContentId(Sha1Hash);
 
 impl ContentId {
@@ -93,16 +143,18 @@ impl Display for ContentId {
     }
 }
 
-impl Serialize for ContentId {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(s)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct EntityId(Sha1Hash);
 
 impl EntityId {
+    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind) -> Self {
+        let mut bytes = Vec::new();
+        parent_id.map(|p| bytes.extend(p.as_bytes()));
+        bytes.extend(name.as_bytes());
+        bytes.extend(kind.as_str().as_bytes());
+        Self::from(Sha1Hash::hash(&bytes))
+    }
+
     pub fn from(hash: Sha1Hash) -> Self {
         Self(hash)
     }
@@ -130,11 +182,55 @@ impl Display for EntityId {
     }
 }
 
-impl Serialize for EntityId {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(s)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Entity {
+    pub id: EntityId,
+    pub parent_id: Option<EntityId>,
+    pub name: String,
+    pub kind: EntityKind,
+}
+
+impl Entity {
+    pub fn new(id: EntityId, parent_id: Option<EntityId>, name: String, kind: EntityKind) -> Self {
+        Self { id, parent_id, name, kind }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Dep<E> {
+    pub src: E,
+    pub tgt: E,
+    pub kind: DepKind,
+    pub byte: usize,
+}
+
+impl<E> Dep<E> {
+    pub fn new(src: E, tgt: E, kind: DepKind, byte: usize) -> Self {
+        Self { src, tgt, kind, byte }
+    }
+}
+
+impl<E: Eq> Dep<E> {
+    pub fn is_loop(&self) -> bool {
+        self.src == self.tgt
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileEndpoint {
+    pub filename: String,
+    pub byte: usize,
+}
+
+impl FileEndpoint {
+    pub fn new(filename: String, byte: usize) -> Self {
+        Self { filename, byte }
+    }
+}
+
+pub type FileDep = Dep<FileEndpoint>;
+
+pub type EntityDep = Dep<EntityId>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileKey {
@@ -145,10 +241,6 @@ pub struct FileKey {
 impl FileKey {
     pub fn new(filename: String, content_id: ContentId) -> Self {
         Self { filename, content_id }
-    }
-
-    pub fn from_strings(filename: String, content_id: String) -> Result<Self> {
-        Ok(Self::new(filename, ContentId::from_str(&content_id)?))
     }
 
     pub fn to_sha1_hash(&self) -> Sha1Hash {
@@ -189,16 +281,16 @@ impl Loc {
 
     pub fn from_span(span: &lsp_positions::Span) -> Self {
         Self {
-            start_byte: to_utf8_byte_index(&span.start),
-            end_byte: to_utf8_byte_index(&span.end),
+            start_byte: Self::to_utf8_byte_index(&span.start),
+            end_byte: Self::to_utf8_byte_index(&span.end),
             start_row: span.start.as_point().row,
             end_row: span.end.as_point().row,
             start_column: span.start.as_point().column,
             end_column: span.end.as_point().column,
         }
     }
-}
 
-fn to_utf8_byte_index(position: &lsp_positions::Position) -> usize {
-    position.containing_line.start + position.column.utf8_offset
+    fn to_utf8_byte_index(position: &lsp_positions::Position) -> usize {
+        position.containing_line.start + position.column.utf8_offset
+    }
 }
