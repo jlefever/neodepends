@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate derive_builder;
 
+use core::Entity;
+use core::EntityDep;
 use core::EntityId;
 use core::FileDep;
 use core::FileKey;
@@ -19,6 +21,7 @@ use std::thread::available_parallelism;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
@@ -35,23 +38,23 @@ use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
 
-use crate::dv8::Dv8Matrix;
 use crate::loading::FileSystem;
+use crate::output::OutputV1;
+use crate::output::OutputV2;
 use crate::stackgraphs::build_stack_graph;
 use crate::stackgraphs::resolve;
-use crate::stackgraphs::StackGraphCtx;
 use crate::storage::LoadResponse;
 use crate::storage::Store;
 
 mod core;
-mod dv8;
 mod entities;
 mod loading;
-mod stackgraphs;
+mod output;
 mod sparse_vec;
+mod stackgraphs;
 mod storage;
 
-const DEFAULT_INDEX_PATH: &str = ".neodepends";
+const DEFAULT_CACHE_DIR: &str = ".neodepends";
 
 /// Scan a project and extract structural dependency information
 ///
@@ -59,11 +62,10 @@ const DEFAULT_INDEX_PATH: &str = ".neodepends";
 /// Neodepends can optionally scan the project as it existed in a previous
 /// commit with the `--commit` option.
 ///
-/// Neodepends relies on an index file to store already scanned files. Only
-/// files that are new or that have been modified since the last scan need to be
-/// processed. This provides signifigant performance benifits when scanning the
-/// project many times (for instance, at different commits or after a small
-/// change).
+/// Neodepends caches files on disk as they are scanned. Only files that are new
+/// or that have been modified since the last scan need to be processed. This
+/// provides signifigant performance benifits when scanning the project many
+/// times (for instance, at different commits or after a small change).
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
@@ -73,14 +75,14 @@ struct Cli {
     #[arg(short, long)]
     project_root: Option<PathBuf>,
 
-    /// The index to store and retrieve values while scanning
+    /// The directory to act as the cache
     ///
     /// Defaults to `.git/.neodepends` or `.neodepends` if the project
     /// root is not a git repository. Will be created if not found.
     #[arg(short, long)]
-    index_path: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
 
-    /// Delete the index before scanning
+    /// Delete the cache before scanning
     #[arg(long)]
     clean: bool,
 
@@ -119,7 +121,15 @@ struct DumpCommand {
     #[arg(long)]
     commit: Option<String>,
 
-    /// Name of dependency matrix in JSON output
+    /// Method to use to resolve dependencies between files or entities
+    #[arg(long, default_value_t = Resolver::StackGraphs)]
+    resolver: Resolver,
+
+    /// Method to use to resolve dependencies between files or entities
+    #[arg(long, default_value_t = DumpFormat::JsonV2)]
+    format: DumpFormat,
+
+    /// Name field in JSON output
     ///
     /// Defaults to the last component of the project root.
     #[arg(long)]
@@ -158,18 +168,18 @@ enum EnabledLang {
 }
 
 impl EnabledLang {
-    fn all() -> &'static [EnabledLang] {
-        &[EnabledLang::Java, EnabledLang::JavaScript, EnabledLang::Python, EnabledLang::TypeScript]
+    fn all() -> &'static [Self] {
+        &[Self::Java, Self::JavaScript, Self::Python, Self::TypeScript]
     }
 }
 
 impl Display for EnabledLang {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EnabledLang::Java => write!(f, "java"),
-            EnabledLang::JavaScript => write!(f, "javascript"),
-            EnabledLang::Python => write!(f, "python"),
-            EnabledLang::TypeScript => write!(f, "typescript"),
+            Self::Java => write!(f, "java"),
+            Self::JavaScript => write!(f, "javascript"),
+            Self::Python => write!(f, "python"),
+            Self::TypeScript => write!(f, "typescript"),
         }
     }
 }
@@ -177,10 +187,44 @@ impl Display for EnabledLang {
 impl From<&EnabledLang> for Lang {
     fn from(value: &EnabledLang) -> Self {
         match value {
-            EnabledLang::Java => Lang::Java,
-            EnabledLang::JavaScript => Lang::JavaScript,
-            EnabledLang::Python => Lang::Python,
-            EnabledLang::TypeScript => Lang::TypeScript,
+            EnabledLang::Java => Self::Java,
+            EnabledLang::JavaScript => Self::JavaScript,
+            EnabledLang::Python => Self::Python,
+            EnabledLang::TypeScript => Self::TypeScript,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+enum Resolver {
+    Depends,
+    StackGraphs,
+}
+
+impl Display for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Depends => write!(f, "depends"),
+            Self::StackGraphs => write!(f, "stackgraphs"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+enum DumpFormat {
+    JsonV1,
+    JsonV2,
+    Sqlite,
+}
+
+impl Display for DumpFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JsonV1 => write!(f, "jsonv1"),
+            Self::JsonV2 => write!(f, "jsonv2"),
+            Self::Sqlite => write!(f, "sqlite"),
         }
     }
 }
@@ -189,11 +233,11 @@ fn project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
     Ok(project_root.unwrap_or(std::env::current_dir()?))
 }
 
-fn index_path<P: AsRef<Path>>(index_path: Option<PathBuf>, project_root: P) -> Result<PathBuf> {
-    Ok(index_path.unwrap_or_else(|| {
+fn cache_dir<P: AsRef<Path>>(cache_dir: Option<PathBuf>, project_root: P) -> Result<PathBuf> {
+    Ok(cache_dir.unwrap_or_else(|| {
         let git_dir = project_root.as_ref().join(".git");
-        let preferred = git_dir.join(DEFAULT_INDEX_PATH);
-        let fallback = project_root.as_ref().join(DEFAULT_INDEX_PATH);
+        let preferred = git_dir.join(DEFAULT_CACHE_DIR);
+        let fallback = project_root.as_ref().join(DEFAULT_CACHE_DIR);
 
         if preferred.exists() {
             preferred
@@ -227,7 +271,7 @@ fn num_threads(num_threads: usize) -> Result<NonZeroUsize> {
 
 struct CommonArgs {
     project_root: PathBuf,
-    index_path: PathBuf,
+    cache_dir: PathBuf,
     clean: bool,
     langs: HashSet<Lang>,
     num_threads: NonZeroUsize,
@@ -236,12 +280,12 @@ struct CommonArgs {
 impl CommonArgs {
     fn from(cli: &Cli) -> Result<Self> {
         let project_root = project_root(cli.project_root.clone())?;
-        let index_path = index_path(cli.index_path.clone(), &project_root)?;
+        let cache_dir = cache_dir(cli.cache_dir.clone(), &project_root)?;
         let num_threads = num_threads(cli.num_threads)?;
 
         Ok(Self {
             project_root,
-            index_path,
+            cache_dir,
             clean: cli.clean,
             langs: cli.langs.iter().map_into().collect(),
             num_threads,
@@ -256,9 +300,9 @@ fn main() -> anyhow::Result<()> {
     let multi_progress = MultiProgress::new();
     LogWrapper::new(multi_progress.clone(), logger).try_init().unwrap();
 
-    if args.clean && args.index_path.exists() {
-        log::info!("Removing existing index...");
-        remove_dir_all(&args.index_path)?;
+    if args.clean && args.cache_dir.exists() {
+        log::info!("Deleting existing cache...");
+        remove_dir_all(&args.cache_dir)?;
     }
 
     let start = Instant::now();
@@ -276,34 +320,44 @@ fn main() -> anyhow::Result<()> {
 fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::Result<()> {
     let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
 
-    let (deps, failures) = collect_deps(fs, &args.index_path, args.num_threads.into(), progress)?;
-    let deps = deps.into_iter().map(|d| (d.src.filename, d.tgt.filename)).collect_vec();
+    if matches!(cmd.resolver, Resolver::Depends) {
+        bail!("depends resolver not yet supported");
+    }
 
-    let matrix = Dv8Matrix::build(
-        name(cmd.name, &args.project_root),
-        deps,
-        failures.iter().map(|k| k.filename.to_string()).collect(),
-    );
+    let name = name(cmd.name, &args.project_root);
+    let (deps, _) =
+        collect_file_deps(fs.clone(), &args.cache_dir, args.num_threads.into(), progress)?;
+
+    let text = match cmd.format {
+        DumpFormat::JsonV1 => {
+            let filenames = fs.list().iter().map(|k| k.filename.clone()).collect();
+            let output = OutputV1::build(&name, filenames, deps)?;
+            serde_json::to_string_pretty(&output)?
+        }
+        DumpFormat::JsonV2 => {
+            let entity_sets = collect_entity_sets(fs);
+            let entities = flatten_entity_sets(&entity_sets);
+            let deps = to_entity_deps(&deps, &entity_sets);
+            let output = OutputV2::build(&name, entities, deps)?;
+            serde_json::to_string_pretty(&output)?
+        }
+        DumpFormat::Sqlite => {
+            bail!("sqlite output not yet suppported");
+        }
+    };
 
     log::info!("Writing output...");
-    let text = serde_json::to_string_pretty(&matrix)?;
     println!("{}", text);
-
     Ok(())
 }
 
 fn ls_entities(args: CommonArgs, cmd: LsEntitiesCommand) -> anyhow::Result<()> {
     let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
-    let entity_sets = collect_entities(fs.clone());
+    let entity_sets = collect_entity_sets(fs);
+    let entities = flatten_entity_sets(&entity_sets);
 
-    for key in fs.list() {
-        if let Some(entity_set) = entity_sets.get(key) {
-            for entity in entity_set.entities() {
-                println!("{}", serde_json::to_string(entity).unwrap());
-            }
-        } else {
-            log::warn!("Failed to extract entities from {}", key.filename);
-        }
+    for entity in &entities {
+        println!("{}", serde_json::to_string(entity)?);
     }
 
     Ok(())
@@ -320,14 +374,50 @@ struct DepDto {
 fn ls_deps(args: CommonArgs, cmd: LsDepsCommand, progress: MultiProgress) -> anyhow::Result<()> {
     let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
 
-    let entity_sets = collect_entities(fs.clone());
-    let (deps, _) = collect_deps(fs.clone(), &args.index_path, args.num_threads.into(), progress)?;
+    let entity_sets = collect_entity_sets(fs.clone());
+    let (deps, _) = collect_file_deps(fs, &args.cache_dir, args.num_threads.into(), progress)?;
 
-    let mut entity_deps = HashSet::new();
+    for dep in to_entity_deps(&deps, &entity_sets) {
+        if !dep.is_loop() {
+            println!("{}", serde_json::to_string(&dep)?);
+        }
+    }
+
+    Ok(())
+}
+
+fn flatten_entity_sets(entity_sets: &HashMap<String, EntitySet>) -> Vec<Entity> {
+    let mut entities = Vec::new();
+
+    for filename in entity_sets.keys().sorted() {
+        for entity in entity_sets[filename].entities() {
+            entities.push(entity.clone());
+        }
+    }
+
+    entities
+}
+
+fn collect_entity_sets(fs: FileSystem) -> HashMap<String, EntitySet> {
+    let mut map = HashMap::with_capacity(fs.list().len());
+
+    for key in fs.list() {
+        if let Some(entity_set) = extract(fs.clone(), &key.filename) {
+            map.insert(key.filename.clone(), entity_set);
+        } else {
+            log::warn!("Failed to extract entities from {}", key.filename);
+        }
+    }
+
+    map
+}
+
+fn to_entity_deps(deps: &[FileDep], entity_sets: &HashMap<String, EntitySet>) -> Vec<EntityDep> {
+    let mut entity_deps = Vec::new();
 
     for dep in deps {
-        let src_set = entity_sets.get(fs.get_by_filename(&dep.src.filename)?);
-        let tgt_set = entity_sets.get(fs.get_by_filename(&dep.tgt.filename)?);
+        let src_set = entity_sets.get(&dep.src.filename);
+        let tgt_set = entity_sets.get(&dep.tgt.filename);
 
         if src_set.is_none() || tgt_set.is_none() {
             continue;
@@ -335,43 +425,25 @@ fn ls_deps(args: CommonArgs, cmd: LsDepsCommand, progress: MultiProgress) -> any
 
         let dep = dep.to_entity_dep(src_set.unwrap(), tgt_set.unwrap());
 
-        if dep.is_loop() {
-            continue;
-        }
-
-        if entity_deps.contains(&dep) {
-            println!("{}", serde_json::to_string(&dep)?);
-        }
-
-        entity_deps.insert(dep);
-    }
-
-    Ok(())
-}
-
-fn collect_entities(fs: FileSystem) -> HashMap<FileKey, EntitySet> {
-    let mut map = HashMap::with_capacity(fs.list().len());
-
-    for key in fs.list() {
-        if let Some(entity_set) = extract(fs.clone(), &key.filename) {
-            map.insert(key.clone(), entity_set);
+        if !dep.is_loop() {
+            entity_deps.push(dep);
         }
     }
 
-    map
+    entity_deps
 }
 
-fn collect_deps(
+fn collect_file_deps(
     fs: FileSystem,
-    index_path: &Path,
+    cache_dir: &Path,
     num_threads: usize,
     progress: MultiProgress,
 ) -> anyhow::Result<(Vec<FileDep>, HashSet<FileKey>)> {
-    let store = Arc::new(Mutex::new(Store::open(index_path)?));
+    let store = Arc::new(Mutex::new(Store::open(cache_dir)?));
     let missing = store.lock().unwrap().find_missing(fs.list());
 
     if missing.len() > 0 {
-        log::info!("Processing {} file(s) which were not found in index...", missing.len());
+        log::info!("Processing {} file(s) which were not found in the cache...", missing.len());
         let bar = progress.add(ProgressBar::new(missing.len() as u64)).with_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:40} {pos}/{len} (ETA: {eta_precise}) {msg}",
