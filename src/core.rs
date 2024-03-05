@@ -3,6 +3,7 @@ use std::fmt::Formatter;
 
 use anyhow::bail;
 use anyhow::Result;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
 use sha1::Digest;
@@ -63,10 +64,39 @@ impl Display for EntityKind {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, EnumString, AsRefStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Deserialize,
+    Serialize,
+    EnumString,
+    AsRefStr,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum DepKind {
+    Annotation,
+    Call,
+    Cast,
+    Contain,
+    Create,
+    Dependency,
+    Extend,
+    Implement,
+    Import,
+    Link,
+    MixIn,
+    Parameter,
+    Parent,
+    Plugin,
+    Receive,
+    Return,
+    Set,
+    Throw,
     Use,
 }
 
@@ -159,6 +189,10 @@ impl ContentId {
     pub fn into_bytes(self) -> [u8; 20] {
         self.0.into_bytes()
     }
+
+    pub fn to_oid(&self) -> git2::Oid {
+        git2::Oid::from_bytes(self.as_bytes()).unwrap()
+    }
 }
 
 impl Display for ContentId {
@@ -220,17 +254,31 @@ impl Entity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum SubFilePosition {
+    Byte(usize),
+    Row(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Dep<E> {
     pub src: E,
     pub tgt: E,
     pub kind: DepKind,
-    pub byte: usize,
+    pub position: SubFilePosition,
 }
 
 impl<E> Dep<E> {
-    pub fn new(src: E, tgt: E, kind: DepKind, byte: usize) -> Self {
-        Self { src, tgt, kind, byte }
+    pub fn new(src: E, tgt: E, kind: DepKind, position: SubFilePosition) -> Self {
+        Self { src, tgt, kind, position }
+    }
+
+    pub fn with_byte(src: E, tgt: E, kind: DepKind, byte: usize) -> Self {
+        Self::new(src, tgt, kind, SubFilePosition::Byte(byte))
+    }
+
+    pub fn with_row(src: E, tgt: E, kind: DepKind, row: usize) -> Self {
+        Self::new(src, tgt, kind, SubFilePosition::Row(row))
     }
 }
 
@@ -243,12 +291,20 @@ impl<E: Eq> Dep<E> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileEndpoint {
     pub filename: String,
-    pub byte: usize,
+    pub position: SubFilePosition,
 }
 
 impl FileEndpoint {
-    pub fn new(filename: String, byte: usize) -> Self {
-        Self { filename, byte }
+    pub fn new(filename: String, position: SubFilePosition) -> Self {
+        Self { filename, position }
+    }
+
+    pub fn with_byte(filename: String, byte: usize) -> Self {
+        Self::new(filename, SubFilePosition::Byte(byte))
+    }
+
+    pub fn with_row(filename: String, row: usize) -> Self {
+        Self::new(filename, SubFilePosition::Row(row))
     }
 }
 

@@ -215,9 +215,9 @@ pub fn resolve(ctx: &mut StackGraphCtx) -> Vec<FileDep> {
     references
         .iter()
         .map(|r| {
-            Dep::new(
-                FileEndpoint::new(filename(r.start_node), byte(r.start_node)),
-                FileEndpoint::new(filename(r.end_node), byte(r.end_node)),
+            Dep::with_byte(
+                FileEndpoint::with_byte(filename(r.start_node), byte(r.start_node)),
+                FileEndpoint::with_byte(filename(r.end_node), byte(r.end_node)),
                 DepKind::Use,
                 byte(r.start_node),
             )

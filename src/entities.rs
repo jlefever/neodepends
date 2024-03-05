@@ -20,6 +20,7 @@ use crate::core::EntityKind;
 use crate::core::FileDep;
 use crate::core::Lang;
 use crate::core::Loc;
+use crate::core::SubFilePosition;
 use crate::loading::FileSystem;
 use crate::sparse_vec::SparseVec;
 use crate::stackgraphs::JAVA_SG;
@@ -46,6 +47,7 @@ pub struct EntitySet {
     entities: HashMap<EntityId, Entity>,
     locations: HashMap<EntityId, Vec<Loc>>,
     byte_table: SparseVec<EntityId>,
+    row_table: SparseVec<EntityId>,
     ordered_ids: Vec<EntityId>,
 }
 
@@ -68,16 +70,20 @@ impl EntitySet {
         &self.locations.get(&id).unwrap()
     }
 
-    pub fn get_by_byte(&self, byte: usize) -> EntityId {
-        self.byte_table.get(byte).unwrap_or(self.file_id)
+    pub fn get_by_position(&self, position: SubFilePosition) -> EntityId {
+        match position {
+            SubFilePosition::Byte(byte) => self.byte_table.get(byte),
+            SubFilePosition::Row(row) => self.row_table.get(row),
+        }
+        .unwrap_or(self.file_id)
     }
 }
 
 impl FileDep {
     pub fn to_entity_dep(&self, src_set: &EntitySet, tgt_set: &EntitySet) -> EntityDep {
-        let src = src_set.get_by_byte(self.src.byte);
-        let tgt = tgt_set.get_by_byte(self.tgt.byte);
-        Dep::new(src, tgt, self.kind, self.byte)
+        let src = src_set.get_by_position(self.src.position);
+        let tgt = tgt_set.get_by_position(self.tgt.position);
+        Dep::new(src, tgt, self.kind, self.position)
     }
 }
 
@@ -88,6 +94,7 @@ impl EntitySet {
         let mut entities = HashMap::with_capacity(pairs.len());
         let mut locations: HashMap<EntityId, Vec<Loc>> = HashMap::with_capacity(pairs.len());
         let mut byte_table = SparseVec::with_capacity(pairs.len());
+        let mut row_table = SparseVec::with_capacity(pairs.len());
         let mut ordered_ids = Vec::with_capacity(pairs.len());
 
         for (entity, loc) in pairs {
@@ -112,12 +119,13 @@ impl EntitySet {
             }
 
             byte_table.insert_many(loc.start_byte, loc.end_byte, entity.id);
+            row_table.insert_many(loc.start_row, loc.end_row, entity.id);
             ordered_ids.push(entity.id);
             entities.insert(entity.id, entity);
         }
 
         if let Some(file_id) = file_id {
-            Ok(EntitySet { file_id, entities, locations, byte_table, ordered_ids })
+            Ok(EntitySet { file_id, entities, locations, byte_table, row_table, ordered_ids })
         } else {
             bail!("entity set must contain exactly one file")
         }

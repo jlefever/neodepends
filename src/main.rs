@@ -38,6 +38,7 @@ use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
 
+use crate::depends::Depends;
 use crate::loading::FileSystem;
 use crate::output::OutputV1;
 use crate::output::OutputV2;
@@ -47,6 +48,7 @@ use crate::storage::LoadResponse;
 use crate::storage::Store;
 
 mod core;
+mod depends;
 mod entities;
 mod loading;
 mod output;
@@ -75,10 +77,9 @@ struct Cli {
     #[arg(short, long)]
     project_root: Option<PathBuf>,
 
-    /// The directory to act as the cache
+    /// The directory to act as the cache. Will be created if not found.
     ///
-    /// Defaults to `.git/.neodepends` or `.neodepends` if the project
-    /// root is not a git repository. Will be created if not found.
+    /// Defaults to `{project_root}/.neodepends`.
     #[arg(short, long)]
     cache_dir: Option<PathBuf>,
 
@@ -96,6 +97,31 @@ struct Cli {
     /// cores)
     #[arg(short, long, default_value_t = 0)]
     num_threads: usize,
+
+    /// Method to use to resolve dependencies between files or entities when
+    /// needed
+    #[arg(long, default_value_t = Resolver::StackGraphs)]
+    resolver: Resolver,
+
+    /// Path to the depends.jar that is used for Depends dependency resolution
+    ///
+    /// If not provided, will look for depends.jar in the same directory as this
+    /// executable.
+    #[arg(long)]
+    depends_jar: Option<PathBuf>,
+
+    /// Java executable used for running depends.jar
+    ///
+    /// If not provided, will assume "java" is on the system path
+    #[arg(long)]
+    depends_java: Option<PathBuf>,
+
+    /// Maximum size of the Java memory allocation pool when running Depends.
+    /// Passed with "-Xmx" to the Java executable. Useful for large projects
+    /// that cause Depends to run out of memory. For example, "12G" for a twelve
+    /// gigabyte memory allocation pool.
+    #[arg(long, default_value = "4G")]
+    depends_xmx: String,
 
     #[command(flatten)]
     verbose: Verbosity<InfoLevel>,
@@ -120,10 +146,6 @@ struct DumpCommand {
     /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
     #[arg(long)]
     commit: Option<String>,
-
-    /// Method to use to resolve dependencies between files or entities
-    #[arg(long, default_value_t = Resolver::StackGraphs)]
-    resolver: Resolver,
 
     /// Method to use to resolve dependencies between files or entities
     #[arg(long, default_value_t = DumpFormat::JsonV2)]
@@ -275,6 +297,10 @@ struct CommonArgs {
     clean: bool,
     langs: HashSet<Lang>,
     num_threads: NonZeroUsize,
+    resolver: Resolver,
+    depends_jar: Option<PathBuf>,
+    depends_java: Option<PathBuf>,
+    depends_xmx: Option<String>,
 }
 
 impl CommonArgs {
@@ -289,6 +315,10 @@ impl CommonArgs {
             clean: cli.clean,
             langs: cli.langs.iter().map_into().collect(),
             num_threads,
+            resolver: cli.resolver,
+            depends_jar: cli.depends_jar.clone(),
+            depends_java: cli.depends_java.clone(),
+            depends_xmx: Some(cli.depends_xmx.clone()),
         })
     }
 }
@@ -320,13 +350,8 @@ fn main() -> anyhow::Result<()> {
 fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::Result<()> {
     let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
 
-    if matches!(cmd.resolver, Resolver::Depends) {
-        bail!("depends resolver not yet supported");
-    }
-
+    let deps = collect_file_deps(&args, fs.clone(), progress)?;
     let name = name(cmd.name, &args.project_root);
-    let (deps, _) =
-        collect_file_deps(fs.clone(), &args.cache_dir, args.num_threads.into(), progress)?;
 
     let text = match cmd.format {
         DumpFormat::JsonV1 => {
@@ -374,8 +399,8 @@ struct DepDto {
 fn ls_deps(args: CommonArgs, cmd: LsDepsCommand, progress: MultiProgress) -> anyhow::Result<()> {
     let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
 
+    let deps = collect_file_deps(&args, fs.clone(), progress)?;
     let entity_sets = collect_entity_sets(fs.clone());
-    let (deps, _) = collect_file_deps(fs, &args.cache_dir, args.num_threads.into(), progress)?;
 
     for dep in to_entity_deps(&deps, &entity_sets) {
         if !dep.is_loop() {
@@ -434,6 +459,26 @@ fn to_entity_deps(deps: &[FileDep], entity_sets: &HashMap<String, EntitySet>) ->
 }
 
 fn collect_file_deps(
+    args: &CommonArgs,
+    fs: FileSystem,
+    progress: MultiProgress,
+) -> Result<Vec<FileDep>> {
+    Ok(match args.resolver {
+        Resolver::Depends => Depends::new(
+            args.depends_jar.clone(),
+            args.depends_java.clone(),
+            args.depends_xmx.clone(),
+        )
+        .resolve(fs)?,
+        Resolver::StackGraphs => {
+            let (deps, _) =
+                collect_file_deps_sg(fs, &args.cache_dir, args.num_threads.into(), progress)?;
+            deps
+        }
+    })
+}
+
+fn collect_file_deps_sg(
     fs: FileSystem,
     cache_dir: &Path,
     num_threads: usize,

@@ -63,6 +63,10 @@ impl FileSystem {
         self.inner.load(key)
     }
 
+    pub fn load_into_buf(&self, key: &FileKey, buf: &mut Vec<u8>) -> Result<usize> {
+        self.inner.load_into_buf(key, buf)
+    }
+
     pub fn get_by_filename<F: AsRef<str>>(&self, filename: F) -> Result<&FileKey> {
         self.file_keys.get_by_filename(&filename).with_context(|| {
             format!("no file named '{}' found in this filesystem", filename.as_ref())
@@ -104,6 +108,13 @@ impl FileSystemInner {
             FileSystemInner::Git(fs, _) => fs.load(&key.content_id),
         }
     }
+
+    pub fn load_into_buf(&self, key: &FileKey, buf: &mut Vec<u8>) -> Result<usize> {
+        match self {
+            FileSystemInner::Disk(fs) => fs.load_into_buf(&key.filename, buf),
+            FileSystemInner::Git(fs, _) => fs.load_into_buf(&key.content_id, buf),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -140,8 +151,12 @@ impl DiskStorage {
 
     fn load<F: AsRef<Path>>(&self, filename: F) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        File::open(self.root.join(filename))?.read_to_end(&mut buf)?;
+        self.load_into_buf(filename, &mut buf)?;
         Ok(buf)
+    }
+
+    pub fn load_into_buf<F: AsRef<Path>>(&self, filename: F, buf: &mut Vec<u8>) -> Result<usize> {
+        Ok(File::open(self.root.join(filename))?.read_to_end(buf)?)
     }
 }
 
@@ -185,8 +200,15 @@ impl GitStorage {
     }
 
     fn load(&self, content_id: &ContentId) -> Result<Vec<u8>> {
-        let oid = Oid::from_bytes(content_id.as_bytes()).unwrap();
-        Ok(self.repo.try_lock().unwrap().find_blob(oid)?.content().to_owned())
+        Ok(self.repo.try_lock().unwrap().find_blob(content_id.to_oid())?.content().to_owned())
+    }
+
+    fn load_into_buf(&self, content_id: &ContentId, buf: &mut Vec<u8>) -> Result<usize> {
+        let repo = self.repo.try_lock().unwrap();
+        let blob = repo.find_blob(content_id.to_oid())?;
+        let slice = blob.content();
+        buf.extend_from_slice(slice);
+        Ok(slice.len())
     }
 }
 
