@@ -1,24 +1,24 @@
 (annotation_type_declaration
-  name: (identifier) @name) @tag.annotation
+  name: (identifier) @name) @tag.Annotation
 
 (constructor_declaration
-  name: (identifier) @name) @tag.constructor
+  name: (identifier) @name) @tag.Constructor
 
 (class_declaration
-  name: (identifier) @name) @tag.class
+  name: (identifier) @name) @tag.Class
 
 (enum_declaration
-  name: (identifier) @name) @tag.enum
+  name: (identifier) @name) @tag.Enum
 
 (field_declaration
   declarator: (variable_declarator
-    name: (identifier) @name)) @tag.field
+    name: (identifier) @name)) @tag.Field
 
 (interface_declaration
-  name: (identifier) @name) @tag.interface
+  name: (identifier) @name) @tag.Interface
 
 (method_declaration
-  name: (identifier) @name) @tag.method
+  name: (identifier) @name) @tag.Method
 
 (record_declaration
-  name: (identifier) @name) @tag.record
+  name: (identifier) @name) @tag.Record

@@ -36,9 +36,19 @@ impl Lang {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, EnumString, AsRefStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Deserialize,
+    Serialize,
+    EnumString,
+    AsRefStr,
 )]
-#[strum(serialize_all = "snake_case")]
 pub enum EntityKind {
     File,
     Annotation,
@@ -77,7 +87,6 @@ impl Display for EntityKind {
     EnumString,
     AsRefStr,
 )]
-#[strum(serialize_all = "snake_case")]
 pub enum DepKind {
     Annotation,
     Call,
