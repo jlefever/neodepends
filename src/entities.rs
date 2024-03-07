@@ -22,7 +22,7 @@ use crate::core::PartialPosition;
 use crate::core::PartialSpan;
 use crate::core::Position;
 use crate::core::Span;
-use crate::core::Tag;
+use crate::core::StableId;
 use crate::loading::FileSystem;
 use crate::sparse_vec::SparseVec;
 use crate::stackgraphs::JAVA_SG;
@@ -32,7 +32,7 @@ lazy_static! {
         Tagger::new(JAVA_SG.language(), include_str!("../languages/java/tags.scm"));
 }
 
-pub fn extract_tags(fs: FileSystem, filename: &str) -> Option<FileTagInfo> {
+pub fn extract_entity_set(fs: FileSystem, filename: &str) -> Option<EntitySet> {
     let lang = Lang::from_filename(filename);
 
     if lang.is_none() {
@@ -42,18 +42,19 @@ pub fn extract_tags(fs: FileSystem, filename: &str) -> Option<FileTagInfo> {
     let source = &fs.load_by_filename(filename).unwrap();
 
     Some(match lang.unwrap() {
-        Lang::Java => JAVA_TAGGER.extract_tags(source, filename).unwrap(),
+        Lang::Java => JAVA_TAGGER.extract(source, filename).unwrap(),
         _ => to_singleton_entity_set(source, filename).unwrap(),
     })
 }
 
-pub struct FileTagInfo {
+pub struct EntitySet {
     entities: HashMap<EntityId, Entity>,
     table: LocationTable,
 }
 
-impl FileTagInfo {
-    fn new<I: IntoIterator<Item = Entity>>(entities: I, table: LocationTable) -> Self {
+impl EntitySet {
+    fn from_topo_vec(entities: Vec<Entity>) -> Self {
+        let table = LocationTable::from_topo_slice(&entities);
         Self { entities: entities.into_iter().map(|e| (e.id, e)).collect(), table }
     }
 
@@ -63,10 +64,6 @@ impl FileTagInfo {
 
     pub fn entities(&self) -> impl IntoIterator<Item = &Entity> {
         self.table.ids().into_iter().map(|id| &self.entities[&id])
-    }
-
-    pub fn tags(&self) -> impl IntoIterator<Item = Tag> + '_ {
-        self.table.tags()
     }
 
     pub fn find_id(&self, position: PartialPosition) -> Option<EntityId> {
@@ -79,7 +76,7 @@ impl FileTagInfo {
 }
 
 impl FileDep {
-    pub fn to_entity_dep(&self, src_set: &FileTagInfo, tgt_set: &FileTagInfo) -> EntityDep {
+    pub fn to_entity_dep(&self, src_set: &EntitySet, tgt_set: &EntitySet) -> EntityDep {
         let src = src_set.find_id(self.src.position).unwrap();
         let tgt = tgt_set.find_id(self.tgt.position).unwrap();
         Dep::new(src, tgt, self.kind, self.position)
@@ -87,30 +84,35 @@ impl FileDep {
 }
 
 struct LocationTable {
-    tags: Vec<Tag>,
+    ids: Vec<EntityId>,
     bytes: SparseVec<EntityId>,
     rows: SparseVec<EntityId>,
 }
 
 impl LocationTable {
-    fn from_topo_vec(tags: Vec<Tag>) -> Self {
-        let mut bytes = SparseVec::with_capacity(tags.len());
-        let mut rows = SparseVec::with_capacity(tags.len());
+    fn from_topo_slice(entities: &[Entity]) -> Self {
+        let mut ids = Vec::with_capacity(entities.len());
+        let mut bytes = SparseVec::with_capacity(entities.len());
+        let mut rows = SparseVec::with_capacity(entities.len());
 
-        for Tag { span, entity_id } in &tags {
-            bytes.insert_many(span.start_byte(), span.end_byte(), *entity_id);
-            rows.insert_many(span.start_row(), span.end_row(), *entity_id);
+        for Entity { id, parent_id, location, .. } in entities {
+            ids.push(*id);
+
+            // TODO: Ensure the file location calculation is correct so this isn't necessary
+            if parent_id.is_none() {
+                bytes.insert_many(usize::MIN, usize::MAX, *id);
+                rows.insert_many(usize::MIN, usize::MAX, *id);
+            } else {
+                bytes.insert_many(location.start_byte(), location.end_byte(), *id);
+                rows.insert_many(location.start_row(), location.end_row(), *id);
+            }
         }
 
-        Self { tags, bytes, rows }
+        Self { ids, bytes, rows }
     }
 
     fn ids(&self) -> impl IntoIterator<Item = EntityId> + '_ {
-        self.tags.iter().map(|&t| t.entity_id).unique()
-    }
-
-    fn tags(&self) -> impl IntoIterator<Item = Tag> + '_ {
-        self.tags.iter().map(|&t| t)
+        self.ids.iter().map(|id| *id)
     }
 
     fn find_id(&self, position: PartialPosition) -> Option<EntityId> {
@@ -131,21 +133,21 @@ impl LocationTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct CaptureId(usize);
+struct TagId(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Builder)]
-struct Capture {
-    id: CaptureId,
-    ancestor_ids: Vec<CaptureId>,
+struct Tag {
+    id: TagId,
+    ancestor_ids: Vec<TagId>,
     name: String,
     kind: EntityKind,
     location: Span,
 }
 
-impl Capture {
+impl Tag {
     fn singleton(filename: &str, end_position: Position) -> Self {
         Self {
-            id: CaptureId(0),
+            id: TagId(0),
             ancestor_ids: vec![],
             name: filename.to_string(),
             kind: EntityKind::File,
@@ -155,7 +157,7 @@ impl Capture {
 
     fn from_root_node(filename: &str, root: &Node<'_>) -> Self {
         Self {
-            id: CaptureId(root.id()),
+            id: TagId(root.id()),
             ancestor_ids: vec![],
             name: filename.to_string(),
             kind: EntityKind::File,
@@ -163,9 +165,9 @@ impl Capture {
         }
     }
 
-    fn find_parent_id(&self, captures: &HashSet<CaptureId>) -> Option<CaptureId> {
+    fn find_parent_id(&self, tags: &HashSet<TagId>) -> Option<TagId> {
         for ancestor_id in &self.ancestor_ids {
-            if captures.contains(&ancestor_id) {
+            if tags.contains(&ancestor_id) {
                 return Some(*ancestor_id);
             }
         }
@@ -200,52 +202,52 @@ impl Tagger {
         Self { language, query, kinds, name }
     }
 
-    pub fn extract_tags(&self, source: &[u8], filename: &str) -> Result<FileTagInfo> {
+    pub fn extract(&self, source: &[u8], filename: &str) -> Result<EntitySet> {
         let mut parser = Parser::new();
         parser.set_language(self.language)?;
         let tree = parser.parse(source, None).context("failed to parse")?;
         let root = tree.root_node();
         let mut cursor = QueryCursor::new();
 
-        let mut captures = HashMap::new();
-        let root_capture = Capture::from_root_node(filename, &root);
-        captures.insert(root_capture.id, root_capture);
+        let mut tags = HashMap::new();
+        let root_tag = Tag::from_root_node(filename, &root);
+        tags.insert(root_tag.id, root_tag);
 
         for r#match in cursor.matches(&self.query, root, source) {
-            let mut builder: CaptureBuilder = CaptureBuilder::default();
+            let mut builder: TagBuilder = TagBuilder::default();
 
             for capture in r#match.captures {
                 if capture.index == self.name {
                     builder.name(capture.node.utf8_text(source).unwrap().to_string());
                 } else if let Some(kind) = self.kinds[capture.index as usize] {
-                    builder.id(CaptureId(capture.node.id()));
+                    builder.id(TagId(capture.node.id()));
                     builder.kind(kind);
                     builder.location(Span::from_ts(&capture.node.range()));
                     builder.ancestor_ids(collect_ancestor_ids(&capture.node));
                 }
             }
 
-            let capture = builder.build()?;
-            captures.insert(capture.id, capture);
+            let tag = builder.build()?;
+            tags.insert(tag.id, tag);
         }
 
-        Ok(into_file_tag_info(captures))
+        Ok(into_file_entity_info(tags))
     }
 }
 
-fn collect_ancestor_ids(node: &Node) -> Vec<CaptureId> {
+fn collect_ancestor_ids(node: &Node) -> Vec<TagId> {
     let mut ids = Vec::new();
     let mut curr: Option<Node> = node.parent();
 
     while let Some(curr_node) = curr {
-        ids.push(CaptureId(curr_node.id()));
+        ids.push(TagId(curr_node.id()));
         curr = curr_node.parent();
     }
 
     ids
 }
 
-fn to_singleton_entity_set(source: &[u8], filename: &str) -> Result<FileTagInfo> {
+fn to_singleton_entity_set(source: &[u8], filename: &str) -> Result<EntitySet> {
     let text = String::from_utf8(source.to_vec())?;
     let mut newlines = Vec::new();
 
@@ -260,28 +262,39 @@ fn to_singleton_entity_set(source: &[u8], filename: &str) -> Result<FileTagInfo>
     let preceeding_length = newlines.last().map(|last| last + 1).unwrap_or(0);
     let end_column = source.len() - preceeding_length;
     let end_position = Position::new(end_byte, end_row, end_column);
-    let capture = Capture::singleton(filename, end_position);
+    let tag = Tag::singleton(filename, end_position);
 
-    let mut captures = HashMap::new();
-    captures.insert(capture.id, capture);
-    Ok(into_file_tag_info(captures))
+    let mut tags = HashMap::new();
+    tags.insert(tag.id, tag);
+    Ok(into_file_entity_info(tags))
 }
 
-fn into_file_tag_info(captures: HashMap<CaptureId, Capture>) -> FileTagInfo {
-    let mut tags = Vec::with_capacity(captures.len());
-    let mut entities = Vec::with_capacity(captures.len());
-    let mut entity_ids = HashMap::with_capacity(captures.len());
-    let capture_ids = captures.keys().map(|&k| k).collect::<HashSet<_>>();
+fn into_file_entity_info(tags: HashMap<TagId, Tag>) -> EntitySet {
+    let mut entities = Vec::with_capacity(tags.len());
+    let mut entity_ids = HashMap::with_capacity(tags.len());
+    let mut stable_ids = HashMap::with_capacity(tags.len());
+    let tag_ids = tags.keys().map(|&k| k).collect::<HashSet<_>>();
 
-    for capture in captures.into_values().sorted_by_cached_key(|c| c.topo_key()) {
-        let parent_capture_id = capture.find_parent_id(&capture_ids);
-        let parent_entity_id = parent_capture_id.map(|id| *entity_ids.get(&id).unwrap());
-        let entity_id = EntityId::new(parent_entity_id, &capture.name, capture.kind);
-        let entity = Entity::new(entity_id, parent_entity_id, capture.name.clone(), capture.kind);
-        tags.push(Tag::new(entity_id, capture.location));
-        entities.push(entity);
-        entity_ids.insert(capture.id, entity_id);
+    for tag in tags.into_values().sorted_by_cached_key(|c| c.topo_key()) {
+        let parent_tag_id = tag.find_parent_id(&tag_ids);
+        let parent_entity_id = parent_tag_id.map(|id| *entity_ids.get(&id).unwrap());
+        let parent_stable_id = parent_tag_id.map(|id| *stable_ids.get(&id).unwrap());
+
+        let entity_id = EntityId::new(parent_entity_id, &tag.name, tag.kind, tag.location);
+        entity_ids.insert(tag.id, entity_id);
+
+        let stable_id = StableId::new(parent_stable_id, &tag.name, tag.kind);
+        stable_ids.insert(tag.id, stable_id);
+
+        entities.push(Entity::new(
+            entity_id,
+            parent_entity_id,
+            stable_id,
+            tag.name.clone(),
+            tag.kind,
+            tag.location,
+        ));
     }
 
-    FileTagInfo::new(entities, LocationTable::from_topo_vec(tags))
+    EntitySet::from_topo_vec(entities)
 }

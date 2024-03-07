@@ -220,9 +220,53 @@ impl Display for ContentId {
 pub struct EntityId(Sha1Hash);
 
 impl EntityId {
-    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind) -> Self {
+    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind, location: Span) -> Self {
         let mut bytes = Vec::new();
-        parent_id.map(|p| bytes.extend(p.as_bytes()));
+        bytes.extend(parent_id.unwrap_or_default().as_bytes());
+        bytes.extend(name.as_bytes());
+        bytes.extend(kind.as_str().as_bytes());
+
+        fn to_bytes(num: usize) -> [u8; 4] {
+            unsafe { std::mem::transmute(u32::try_from(num).unwrap().to_be()) }
+        }
+
+        bytes.extend(to_bytes(location.start_byte()));
+        bytes.extend(to_bytes(location.start_row()));
+        bytes.extend(to_bytes(location.start_column()));
+        bytes.extend(to_bytes(location.end_byte()));
+        bytes.extend(to_bytes(location.end_row()));
+        bytes.extend(to_bytes(location.end_column()));
+        Self::from(Sha1Hash::hash(&bytes))
+    }
+
+    pub fn from(hash: Sha1Hash) -> Self {
+        Self(hash)
+    }
+
+    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
+        Ok(Self(Sha1Hash::from_str(str)?))
+    }
+
+    pub fn to_string(&self) -> String {
+        self.0.to_string()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn into_bytes(self) -> [u8; 20] {
+        self.0.into_bytes()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct StableId(Sha1Hash);
+
+impl StableId {
+    pub fn new(parent_id: Option<StableId>, name: &str, kind: EntityKind) -> Self {
+        let mut bytes = Vec::new();
+        bytes.extend(parent_id.unwrap_or_default().as_bytes());
         bytes.extend(name.as_bytes());
         bytes.extend(kind.as_str().as_bytes());
         Self::from(Sha1Hash::hash(&bytes))
@@ -259,13 +303,22 @@ impl Display for EntityId {
 pub struct Entity {
     pub id: EntityId,
     pub parent_id: Option<EntityId>,
+    pub stable_id: StableId,
     pub name: String,
     pub kind: EntityKind,
+    pub location: Span,
 }
 
 impl Entity {
-    pub fn new(id: EntityId, parent_id: Option<EntityId>, name: String, kind: EntityKind) -> Self {
-        Self { id, parent_id, name, kind }
+    pub fn new(
+        id: EntityId,
+        parent_id: Option<EntityId>,
+        stable_id: StableId,
+        name: String,
+        kind: EntityKind,
+        location: Span,
+    ) -> Self {
+        Self { id, parent_id, stable_id, name, kind, location }
     }
 }
 
@@ -437,18 +490,6 @@ impl PartialSpan {
 
     pub fn end_column(self) -> Option<usize> {
         self.end().column()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Tag {
-    pub entity_id: EntityId,
-    pub span: Span,
-}
-
-impl Tag {
-    pub fn new(entity_id: EntityId, span: Span) -> Self {
-        Self { entity_id, span }
     }
 }
 
