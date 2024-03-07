@@ -1,8 +1,12 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
 use anyhow::bail;
 use anyhow::Result;
+use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
@@ -10,6 +14,8 @@ use sha1::Digest;
 use sha1::Sha1;
 use strum_macros::AsRefStr;
 use strum_macros::EnumString;
+
+use crate::sparse_vec::SparseVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lang {
@@ -264,9 +270,186 @@ impl Entity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub enum SubFilePosition {
+pub struct Position {
+    pub byte: usize,
+    pub row: usize,
+    pub column: usize,
+}
+
+impl Position {
+    pub fn new(byte: usize, row: usize, column: usize) -> Self {
+        Self { byte, row, column }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct Span {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Span {
+    pub fn new(start: Position, end: Position) -> Self {
+        Self { start, end }
+    }
+
+    pub fn from_ts(range: &tree_sitter::Range) -> Self {
+        let &tree_sitter::Range { start_byte, end_byte, start_point, end_point } = range;
+        let start = Position::new(start_byte, start_point.row, start_point.column);
+        let end = Position::new(end_byte, end_point.row, end_point.column);
+        Self::new(start, end)
+    }
+
+    pub fn from_lsp(span: &lsp_positions::Span) -> Self {
+        fn to_utf8_byte_index(position: &lsp_positions::Position) -> usize {
+            position.containing_line.start + position.column.utf8_offset
+        }
+        let start = Position::new(
+            to_utf8_byte_index(&span.start),
+            span.start.as_point().row,
+            span.start.as_point().column,
+        );
+        let end = Position::new(
+            to_utf8_byte_index(&span.start),
+            span.start.as_point().row,
+            span.start.as_point().column,
+        );
+        Self::new(start, end)
+    }
+
+    pub fn start_byte(self) -> usize {
+        self.start.byte
+    }
+
+    pub fn start_row(self) -> usize {
+        self.start.row
+    }
+
+    pub fn start_column(self) -> usize {
+        self.start.column
+    }
+
+    pub fn end_byte(self) -> usize {
+        self.end.byte
+    }
+
+    pub fn end_row(self) -> usize {
+        self.end.row
+    }
+
+    pub fn end_column(self) -> usize {
+        self.end.column
+    }
+}
+
+impl PartialOrd for Span {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(match self.start.cmp(&other.start) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Equal => self.end.cmp(&other.start).reverse(),
+            Ordering::Greater => Ordering::Greater,
+        })
+    }
+}
+
+impl Ord for Span {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum PartialPosition {
     Byte(usize),
     Row(usize),
+    Whole(Position),
+}
+
+impl PartialPosition {
+    pub fn byte(self) -> Option<usize> {
+        match self {
+            PartialPosition::Byte(byte) => Some(byte),
+            PartialPosition::Row(_) => None,
+            PartialPosition::Whole(whole) => Some(whole.byte),
+        }
+    }
+
+    pub fn row(self) -> Option<usize> {
+        match self {
+            PartialPosition::Byte(_) => None,
+            PartialPosition::Row(row) => Some(row),
+            PartialPosition::Whole(whole) => Some(whole.row),
+        }
+    }
+
+    pub fn column(self) -> Option<usize> {
+        match self {
+            PartialPosition::Byte(_) => None,
+            PartialPosition::Row(_) => None,
+            PartialPosition::Whole(whole) => Some(whole.column),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum PartialSpan {
+    Byte(usize, usize),
+    Row(usize, usize),
+    Whole(Span),
+}
+
+impl PartialSpan {
+    pub fn start(self) -> PartialPosition {
+        match self {
+            PartialSpan::Byte(start, _) => PartialPosition::Byte(start),
+            PartialSpan::Row(start, _) => PartialPosition::Row(start),
+            PartialSpan::Whole(whole) => PartialPosition::Whole(whole.start),
+        }
+    }
+
+    pub fn end(self) -> PartialPosition {
+        match self {
+            PartialSpan::Byte(_, end) => PartialPosition::Byte(end),
+            PartialSpan::Row(_, end) => PartialPosition::Row(end),
+            PartialSpan::Whole(whole) => PartialPosition::Whole(whole.end),
+        }
+    }
+
+    pub fn start_byte(self) -> Option<usize> {
+        self.start().byte()
+    }
+
+    pub fn start_row(self) -> Option<usize> {
+        self.start().row()
+    }
+
+    pub fn start_column(self) -> Option<usize> {
+        self.start().column()
+    }
+
+    pub fn end_byte(self) -> Option<usize> {
+        self.end().byte()
+    }
+
+    pub fn end_row(self) -> Option<usize> {
+        self.end().row()
+    }
+
+    pub fn end_column(self) -> Option<usize> {
+        self.end().column()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Tag {
+    pub entity_id: EntityId,
+    pub span: Span,
+}
+
+impl Tag {
+    pub fn new(entity_id: EntityId, span: Span) -> Self {
+        Self { entity_id, span }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -274,20 +457,12 @@ pub struct Dep<E> {
     pub src: E,
     pub tgt: E,
     pub kind: DepKind,
-    pub position: SubFilePosition,
+    pub position: PartialPosition,
 }
 
 impl<E> Dep<E> {
-    pub fn new(src: E, tgt: E, kind: DepKind, position: SubFilePosition) -> Self {
+    pub fn new(src: E, tgt: E, kind: DepKind, position: PartialPosition) -> Self {
         Self { src, tgt, kind, position }
-    }
-
-    pub fn with_byte(src: E, tgt: E, kind: DepKind, byte: usize) -> Self {
-        Self::new(src, tgt, kind, SubFilePosition::Byte(byte))
-    }
-
-    pub fn with_row(src: E, tgt: E, kind: DepKind, row: usize) -> Self {
-        Self::new(src, tgt, kind, SubFilePosition::Row(row))
     }
 }
 
@@ -300,20 +475,12 @@ impl<E: Eq> Dep<E> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileEndpoint {
     pub filename: String,
-    pub position: SubFilePosition,
+    pub position: PartialPosition,
 }
 
 impl FileEndpoint {
-    pub fn new(filename: String, position: SubFilePosition) -> Self {
+    pub fn new(filename: String, position: PartialPosition) -> Self {
         Self { filename, position }
-    }
-
-    pub fn with_byte(filename: String, byte: usize) -> Self {
-        Self::new(filename, SubFilePosition::Byte(byte))
-    }
-
-    pub fn with_row(filename: String, row: usize) -> Self {
-        Self::new(filename, SubFilePosition::Row(row))
     }
 }
 
@@ -343,43 +510,5 @@ impl FileKey {
 impl Display for FileKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.content_id, self.filename)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Loc {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_row: usize,
-    pub end_row: usize,
-    pub start_column: usize,
-    pub end_column: usize,
-}
-
-impl Loc {
-    pub fn from_range(range: &tree_sitter::Range) -> Self {
-        Self {
-            start_byte: range.start_byte,
-            end_byte: range.end_byte,
-            start_row: range.start_point.row,
-            end_row: range.end_point.row,
-            start_column: range.start_point.column,
-            end_column: range.end_point.column,
-        }
-    }
-
-    pub fn from_span(span: &lsp_positions::Span) -> Self {
-        Self {
-            start_byte: Self::to_utf8_byte_index(&span.start),
-            end_byte: Self::to_utf8_byte_index(&span.end),
-            start_row: span.start.as_point().row,
-            end_row: span.end.as_point().row,
-            start_column: span.start.as_point().column,
-            end_column: span.end.as_point().column,
-        }
-    }
-
-    fn to_utf8_byte_index(position: &lsp_positions::Position) -> usize {
-        position.containing_line.start + position.column.utf8_offset
     }
 }

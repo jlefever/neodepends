@@ -20,7 +20,8 @@ use crate::core::DepKind;
 use crate::core::FileDep;
 use crate::core::FileEndpoint;
 use crate::core::Lang;
-use crate::core::Loc;
+use crate::core::PartialPosition;
+use crate::core::Span;
 
 static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
@@ -210,16 +211,19 @@ pub fn resolve(ctx: &mut StackGraphCtx) -> Vec<FileDep> {
     );
 
     let filename = |n: Handle<Node>| ctx.graph[ctx.graph[n].file().unwrap()].name().to_string();
-    let byte = |n: Handle<Node>| Loc::from_span(&ctx.graph.source_info(n).unwrap().span).start_byte;
+    let position = |n: Handle<Node>| {
+        PartialPosition::Whole(Span::from_lsp(&ctx.graph.source_info(n).unwrap().span).start)
+    };
 
     references
         .iter()
         .map(|r| {
-            Dep::with_byte(
-                FileEndpoint::with_byte(filename(r.start_node), byte(r.start_node)),
-                FileEndpoint::with_byte(filename(r.end_node), byte(r.end_node)),
+            let start_node_pos = position(r.start_node);
+            Dep::new(
+                FileEndpoint::new(filename(r.start_node), start_node_pos),
+                FileEndpoint::new(filename(r.end_node), position(r.end_node)),
                 DepKind::Use,
-                byte(r.start_node),
+                start_node_pos,
             )
         })
         .collect()

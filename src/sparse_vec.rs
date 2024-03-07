@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use itertools::Itertools;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Interval {
     start: usize,
     end: usize,
@@ -23,13 +23,13 @@ impl Interval {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct Entry<T: Default + Copy + Eq> {
+#[derive(Debug, Clone, Copy)]
+struct Entry<T: Copy + Eq> {
     key: Interval,
     value: T,
 }
 
-impl<T: Default + Copy + Eq> Entry<T> {
+impl<T: Copy + Eq> Entry<T> {
     fn new(key: Interval, value: T) -> Self {
         Self { key, value }
     }
@@ -41,11 +41,11 @@ impl<T: Default + Copy + Eq> Entry<T> {
 }
 
 #[derive(Debug)]
-pub struct SparseVec<T: Default + Copy + Eq> {
+pub struct SparseVec<T: Copy + Eq> {
     entries: Vec<Entry<T>>,
 }
 
-impl<T: Default + Copy + Eq> SparseVec<T> {
+impl<T: Copy + Eq> SparseVec<T> {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),

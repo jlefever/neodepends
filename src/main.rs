@@ -1,3 +1,4 @@
+#![feature(map_try_insert)]
 #[macro_use]
 extern crate derive_builder;
 
@@ -30,8 +31,8 @@ use clap::Subcommand;
 use clap::ValueEnum;
 use clap_verbosity_flag::InfoLevel;
 use clap_verbosity_flag::Verbosity;
-use entities::extract;
-use entities::EntitySet;
+use entities::extract_tags;
+use entities::FileTagInfo;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
@@ -411,7 +412,7 @@ fn ls_deps(args: CommonArgs, cmd: LsDepsCommand, progress: MultiProgress) -> any
     Ok(())
 }
 
-fn flatten_entity_sets(entity_sets: &HashMap<String, EntitySet>) -> Vec<Entity> {
+fn flatten_entity_sets(entity_sets: &HashMap<String, FileTagInfo>) -> Vec<Entity> {
     let mut entities = Vec::new();
 
     for filename in entity_sets.keys().sorted() {
@@ -423,11 +424,11 @@ fn flatten_entity_sets(entity_sets: &HashMap<String, EntitySet>) -> Vec<Entity> 
     entities
 }
 
-fn collect_entity_sets(fs: FileSystem) -> HashMap<String, EntitySet> {
+fn collect_entity_sets(fs: FileSystem) -> HashMap<String, FileTagInfo> {
     let mut map = HashMap::with_capacity(fs.list().len());
 
     for key in fs.list() {
-        if let Some(entity_set) = extract(fs.clone(), &key.filename) {
+        if let Some(entity_set) = extract_tags(fs.clone(), &key.filename) {
             map.insert(key.filename.clone(), entity_set);
         } else {
             log::warn!("Failed to extract entities from {}", key.filename);
@@ -437,7 +438,7 @@ fn collect_entity_sets(fs: FileSystem) -> HashMap<String, EntitySet> {
     map
 }
 
-fn to_entity_deps(deps: &[FileDep], entity_sets: &HashMap<String, EntitySet>) -> Vec<EntityDep> {
+fn to_entity_deps(deps: &[FileDep], entity_sets: &HashMap<String, FileTagInfo>) -> Vec<EntityDep> {
     let mut entity_deps = Vec::new();
 
     for dep in deps {

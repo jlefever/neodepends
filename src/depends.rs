@@ -15,6 +15,7 @@ use tempfile::TempDir;
 use crate::core::DepKind;
 use crate::core::FileDep;
 use crate::core::FileEndpoint;
+use crate::core::PartialPosition;
 use crate::loading::FileSystem;
 
 pub struct Depends {
@@ -156,6 +157,6 @@ struct DependsEndpoint {
 
 impl DependsEndpoint {
     fn into_file_endoint(self) -> FileEndpoint {
-        FileEndpoint::with_row(self.filename, self.line - 1)
+        FileEndpoint::new(self.filename, PartialPosition::Row(self.line - 1))
     }
 }
