@@ -1,12 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
 use anyhow::bail;
 use anyhow::Result;
-use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
@@ -14,8 +12,6 @@ use sha1::Digest;
 use sha1::Sha1;
 use strum_macros::AsRefStr;
 use strum_macros::EnumString;
-
-use crate::sparse_vec::SparseVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lang {
@@ -38,6 +34,31 @@ impl Lang {
 
     pub fn from_filename<S: AsRef<str>>(filename: S) -> Option<Lang> {
         filename.as_ref().split(".").last().and_then(Self::from_ext)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FileFilter {
+    ByLang(HashSet<Lang>),
+    ByFilename(HashSet<String>),
+}
+
+impl FileFilter {
+    pub fn from_langs<I: IntoIterator<Item = Lang>>(langs: I) -> Self {
+        Self::ByLang(langs.into_iter().collect())
+    }
+
+    pub fn from_filenames<I: IntoIterator<Item = String>>(filenames: I) -> Self {
+        Self::ByFilename(filenames.into_iter().collect())
+    }
+
+    pub fn includes<S: AsRef<str>>(&self, filename: S) -> bool {
+        match self {
+            FileFilter::ByLang(langs) => {
+                Lang::from_filename(filename).map(|l| langs.contains(&l)).unwrap_or(false)
+            }
+            FileFilter::ByFilename(filenames) => filenames.contains(filename.as_ref()),
+        }
     }
 }
 
@@ -131,13 +152,14 @@ impl Display for DepKind {
 pub struct Sha1Hash([u8; 20]);
 
 impl Sha1Hash {
+    #[allow(dead_code)]
     pub fn new(arr: [u8; 20]) -> Self {
         Self(arr)
     }
 
-    pub fn hash(data: &[u8]) -> Self {
+    pub fn hash(bytes: &[u8]) -> Self {
         let mut hasher = Sha1::new();
-        hasher.update(data);
+        hasher.update(bytes);
         Self(hasher.finalize().into())
     }
 
@@ -155,11 +177,6 @@ impl Sha1Hash {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
-    }
-
-    #[allow(dead_code)]
-    pub fn into_bytes(self) -> [u8; 20] {
-        self.0
     }
 }
 
@@ -185,6 +202,36 @@ impl Serialize for Sha1Hash {
 pub struct ContentId(Sha1Hash);
 
 impl ContentId {
+    #[allow(dead_code)]
+    pub fn from(hash: Sha1Hash) -> Self {
+        Self(hash)
+    }
+
+    #[allow(dead_code)]
+    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
+        Ok(Self(Sha1Hash::from_str(str)?))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_oid(&self) -> git2::Oid {
+        git2::Oid::from_bytes(self.as_bytes()).unwrap()
+    }
+}
+
+impl From<git2::Oid> for ContentId {
+    fn from(value: git2::Oid) -> Self {
+        unsafe { std::mem::transmute(value) }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct CommitId(Sha1Hash);
+
+impl CommitId {
+    #[allow(dead_code)]
     pub fn from(hash: Sha1Hash) -> Self {
         Self(hash)
     }
@@ -193,16 +240,8 @@ impl ContentId {
         Ok(Self(Sha1Hash::from_str(str)?))
     }
 
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
-    }
-
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
-    }
-
-    pub fn into_bytes(self) -> [u8; 20] {
-        self.0.into_bytes()
     }
 
     pub fn to_oid(&self) -> git2::Oid {
@@ -210,21 +249,55 @@ impl ContentId {
     }
 }
 
-impl Display for ContentId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct EntityId(Sha1Hash);
 
 impl EntityId {
-    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind, location: Span) -> Self {
+    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind) -> Self {
         let mut bytes = Vec::new();
         bytes.extend(parent_id.unwrap_or_default().as_bytes());
         bytes.extend(name.as_bytes());
         bytes.extend(kind.as_str().as_bytes());
+        Self::from(Sha1Hash::hash(&bytes))
+    }
+
+    pub fn from(hash: Sha1Hash) -> Self {
+        Self(hash)
+    }
+
+    #[allow(dead_code)]
+    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
+        Ok(Self(Sha1Hash::from_str(str)?))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Entity {
+    pub id: EntityId,
+    pub parent_id: Option<EntityId>,
+    pub name: String,
+    pub kind: EntityKind,
+}
+
+impl Entity {
+    pub fn new(parent_id: Option<EntityId>, name: String, kind: EntityKind) -> Self {
+        let id = EntityId::new(parent_id, &name, kind);
+        Self { id, parent_id, name, kind }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct TagId(Sha1Hash);
+
+impl TagId {
+    pub fn new(parent_id: Option<TagId>, entity_id: EntityId, location: Span) -> Self {
+        let mut bytes = Vec::new();
+        bytes.extend(parent_id.unwrap_or_default().as_bytes());
+        bytes.extend(entity_id.as_bytes());
 
         fn to_bytes(num: usize) -> [u8; 4] {
             unsafe { std::mem::transmute(u32::try_from(num).unwrap().to_be()) }
@@ -243,82 +316,28 @@ impl EntityId {
         Self(hash)
     }
 
+    #[allow(dead_code)]
     pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
         Ok(Self(Sha1Hash::from_str(str)?))
     }
 
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
-    }
-
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
-    }
-
-    pub fn into_bytes(self) -> [u8; 20] {
-        self.0.into_bytes()
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct StableId(Sha1Hash);
-
-impl StableId {
-    pub fn new(parent_id: Option<StableId>, name: &str, kind: EntityKind) -> Self {
-        let mut bytes = Vec::new();
-        bytes.extend(parent_id.unwrap_or_default().as_bytes());
-        bytes.extend(name.as_bytes());
-        bytes.extend(kind.as_str().as_bytes());
-        Self::from(Sha1Hash::hash(&bytes))
-    }
-
-    pub fn from(hash: Sha1Hash) -> Self {
-        Self(hash)
-    }
-
-    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
-        Ok(Self(Sha1Hash::from_str(str)?))
-    }
-
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-
-    pub fn into_bytes(self) -> [u8; 20] {
-        self.0.into_bytes()
-    }
-}
-
-impl Display for EntityId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Entity {
-    pub id: EntityId,
-    pub parent_id: Option<EntityId>,
-    pub stable_id: StableId,
-    pub name: String,
-    pub kind: EntityKind,
+pub struct Tag {
+    pub id: TagId,
+    pub parent_id: Option<TagId>,
+    pub entity: Entity,
     pub location: Span,
 }
 
-impl Entity {
-    pub fn new(
-        id: EntityId,
-        parent_id: Option<EntityId>,
-        stable_id: StableId,
-        name: String,
-        kind: EntityKind,
-        location: Span,
-    ) -> Self {
-        Self { id, parent_id, stable_id, name, kind, location }
+impl Tag {
+    pub fn new(parent_id: Option<TagId>, entity: Entity, location: Span) -> Self {
+        let id = TagId::new(parent_id, entity.id, location);
+        Self { id, parent_id, entity, location }
     }
 }
 
@@ -418,32 +437,6 @@ pub enum PartialPosition {
     Whole(Position),
 }
 
-impl PartialPosition {
-    pub fn byte(self) -> Option<usize> {
-        match self {
-            PartialPosition::Byte(byte) => Some(byte),
-            PartialPosition::Row(_) => None,
-            PartialPosition::Whole(whole) => Some(whole.byte),
-        }
-    }
-
-    pub fn row(self) -> Option<usize> {
-        match self {
-            PartialPosition::Byte(_) => None,
-            PartialPosition::Row(row) => Some(row),
-            PartialPosition::Whole(whole) => Some(whole.row),
-        }
-    }
-
-    pub fn column(self) -> Option<usize> {
-        match self {
-            PartialPosition::Byte(_) => None,
-            PartialPosition::Row(_) => None,
-            PartialPosition::Whole(whole) => Some(whole.column),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum PartialSpan {
     Byte(usize, usize),
@@ -451,45 +444,22 @@ pub enum PartialSpan {
     Whole(Span),
 }
 
-impl PartialSpan {
-    pub fn start(self) -> PartialPosition {
-        match self {
-            PartialSpan::Byte(start, _) => PartialPosition::Byte(start),
-            PartialSpan::Row(start, _) => PartialPosition::Row(start),
-            PartialSpan::Whole(whole) => PartialPosition::Whole(whole.start),
-        }
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileKey {
+    pub filename: String,
+    pub content_id: ContentId,
+}
+
+impl FileKey {
+    pub fn new(filename: String, content_id: ContentId) -> Self {
+        Self { filename, content_id }
     }
 
-    pub fn end(self) -> PartialPosition {
-        match self {
-            PartialSpan::Byte(_, end) => PartialPosition::Byte(end),
-            PartialSpan::Row(_, end) => PartialPosition::Row(end),
-            PartialSpan::Whole(whole) => PartialPosition::Whole(whole.end),
-        }
-    }
-
-    pub fn start_byte(self) -> Option<usize> {
-        self.start().byte()
-    }
-
-    pub fn start_row(self) -> Option<usize> {
-        self.start().row()
-    }
-
-    pub fn start_column(self) -> Option<usize> {
-        self.start().column()
-    }
-
-    pub fn end_byte(self) -> Option<usize> {
-        self.end().byte()
-    }
-
-    pub fn end_row(self) -> Option<usize> {
-        self.end().row()
-    }
-
-    pub fn end_column(self) -> Option<usize> {
-        self.end().column()
+    pub fn to_sha1_hash(&self) -> Sha1Hash {
+        let mut bytes = Vec::new();
+        bytes.extend(self.filename.as_bytes());
+        bytes.extend(self.content_id.as_bytes());
+        Sha1Hash::hash(&bytes)
     }
 }
 
@@ -515,41 +485,97 @@ impl<E: Eq> Dep<E> {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileEndpoint {
-    pub filename: String,
+    pub file_key: FileKey,
     pub position: PartialPosition,
 }
 
 impl FileEndpoint {
-    pub fn new(filename: String, position: PartialPosition) -> Self {
-        Self { filename, position }
+    pub fn new(file_key: FileKey, position: PartialPosition) -> Self {
+        Self { file_key, position }
     }
 }
 
 pub type FileDep = Dep<FileEndpoint>;
 
-pub type EntityDep = Dep<EntityId>;
+pub type TagDep = Dep<TagId>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, AsRefStr)]
+pub enum ChangeKind {
+    Added,
+    Deleted,
+    Modified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Change<T> {
+    pub target_id: T,
+    pub commit_id: CommitId,
+    pub kind: ChangeKind,
+    pub adds: usize,
+    pub dels: usize,
+}
+
+impl<T> Change<T> {
+    pub fn new(
+        target_id: T,
+        commit_id: CommitId,
+        kind: ChangeKind,
+        adds: usize,
+        dels: usize,
+    ) -> Self {
+        Self { target_id, commit_id, kind, adds, dels }
+    }
+
+    pub fn with_id<U>(&self, target_id: U) -> Change<U> {
+        Change::<U>::new(target_id, self.commit_id, self.kind, self.adds, self.dels)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Hunk {
+    pub old: PartialSpan,
+    pub new: PartialSpan,
+}
+
+impl Hunk {
+    pub fn from_git(hunk: &git2::DiffHunk) -> Self {
+        let old_start = usize::try_from(hunk.old_start()).unwrap() - 1;
+        let old_end = old_start + usize::try_from(hunk.old_lines()).unwrap();
+        let old = PartialSpan::Row(old_start, old_end);
+        let new_start = usize::try_from(hunk.new_start()).unwrap() - 1;
+        let new_end = new_start + usize::try_from(hunk.new_lines()).unwrap();
+        let new = PartialSpan::Row(new_start, new_end);
+        Self { old, new }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FileKey {
-    pub filename: String,
-    pub content_id: ContentId,
+pub struct Diff {
+    pub commit_id: CommitId,
+    pub old: Option<FileKey>,
+    pub new: Option<FileKey>,
+    pub hunks: Vec<Hunk>,
 }
 
-impl FileKey {
-    pub fn new(filename: String, content_id: ContentId) -> Self {
-        Self { filename, content_id }
+impl Diff {
+    pub fn deleted(commit_id: CommitId, old: FileKey) -> Self {
+        Self { commit_id, old: Some(old), new: None, hunks: Vec::new() }
     }
 
-    pub fn to_sha1_hash(&self) -> Sha1Hash {
-        let mut bytes = Vec::new();
-        bytes.extend(self.filename.as_bytes());
-        bytes.extend(self.content_id.as_bytes());
-        Sha1Hash::hash(&bytes)
+    pub fn added(commit_id: CommitId, new: FileKey) -> Self {
+        Self { commit_id, old: None, new: Some(new), hunks: Vec::new() }
     }
-}
 
-impl Display for FileKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}", self.content_id, self.filename)
+    pub fn modified(commit_id: CommitId, old: FileKey, new: FileKey, hunks: Vec<Hunk>) -> Self {
+        Self { commit_id, old: Some(old), new: Some(new), hunks }
+    }
+
+    pub fn change_kind(&self) -> ChangeKind {
+        match (&self.old, &self.new) {
+            (None, None) => panic!(),
+            (None, Some(_)) => ChangeKind::Added,
+            (Some(_), None) => ChangeKind::Deleted,
+            (Some(_), Some(_)) => ChangeKind::Modified,
+        }
     }
 }

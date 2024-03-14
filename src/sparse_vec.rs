@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
+use std::hash::Hash;
 use std::ops::Range;
 
+use counter::Counter;
 use itertools::Itertools;
 
 #[derive(Debug, Clone, Copy)]
@@ -45,28 +47,37 @@ pub struct SparseVec<T: Copy + Eq> {
     entries: Vec<Entry<T>>,
 }
 
-impl<T: Copy + Eq> SparseVec<T> {
+impl<T: Copy + Eq + Hash> SparseVec<T> {
+    #[allow(dead_code)]
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self { entries: Vec::new() }
     }
 
-    #[allow(dead_code)]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(capacity),
-        }
+        Self { entries: Vec::with_capacity(capacity) }
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, point: usize) -> Option<T> {
         self.search(point).ok().map(|i| self.entries[i].value)
     }
 
+    #[allow(dead_code)]
     pub fn get_many(&self, start: usize, end: usize) -> impl IntoIterator<Item = T> + '_ {
         let indices = self.find_overlapping_indices(Interval::new(start, end));
         self.entries[indices].iter().map(|e| e.value).dedup()
+    }
+
+    pub fn get_overlaps(&self, start: usize, end: usize) -> Counter<T> {
+        let mut counts = Counter::new();
+
+        for i in self.find_overlapping_indices(Interval::new(start, end)) {
+            let entry = self.entries[i];
+            let start = usize::max(entry.key.start, start);
+            let end = usize::min(entry.key.end, end);
+            counts[&entry.value] += 1 + end - start;
+        }
+
+        counts
     }
 
     #[allow(dead_code)]

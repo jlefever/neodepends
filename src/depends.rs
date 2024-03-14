@@ -29,14 +29,14 @@ impl Depends {
         Self { jar, java, xmx }
     }
 
-    pub fn resolve(&self, fs: FileSystem) -> Result<Vec<FileDep>> {
+    pub fn resolve(&self, fs: &FileSystem) -> Result<Vec<FileDep>> {
         log::info!("Copying relevent source files to a temp directory for Depends...");
         let work_dir = TempDir::new()?;
         copy_to_dir(fs, &work_dir)?;
         log::info!("Running Depends...");
         self.run(&work_dir)?;
         log::info!("Collecting Depends output and removing temp directory...");
-        let deps = load_depends_output(&work_dir)?.iter_file_deps().collect_vec();
+        let deps = load_depends_output(&work_dir)?.iter_file_deps(fs).collect_vec();
         Ok(deps)
     }
 
@@ -70,7 +70,7 @@ impl Depends {
     }
 }
 
-fn copy_to_dir<P: AsRef<Path>>(fs: FileSystem, dir: P) -> Result<()> {
+fn copy_to_dir<P: AsRef<Path>>(fs: &FileSystem, dir: P) -> Result<()> {
     let mut buffer = Vec::new();
 
     for key in fs.list() {
@@ -108,8 +108,8 @@ struct DependsOutput {
 }
 
 impl DependsOutput {
-    fn iter_file_deps(self) -> impl Iterator<Item = FileDep> {
-        self.cells.into_iter().flat_map(|c| c.iter_file_deps())
+    fn iter_file_deps(self, fs: &FileSystem) -> impl Iterator<Item = FileDep> + '_ {
+        self.cells.into_iter().flat_map(|c| c.iter_file_deps(fs))
     }
 }
 
@@ -120,8 +120,8 @@ struct DependsCell {
 }
 
 impl DependsCell {
-    fn iter_file_deps(self) -> impl Iterator<Item = FileDep> {
-        self.details.into_iter().flat_map(|d| d.into_iter().map(|d| d.into_file_dep()))
+    fn iter_file_deps(self, fs: &FileSystem) -> impl Iterator<Item = FileDep> + '_ {
+        self.details.into_iter().flat_map(|d| d.into_iter().map(|d| d.into_file_dep(fs)))
     }
 }
 
@@ -138,9 +138,9 @@ struct DependsDetail {
 }
 
 impl DependsDetail {
-    fn into_file_dep(self) -> FileDep {
-        let src = self.src.into_file_endoint();
-        let tgt = self.tgt.into_file_endoint();
+    fn into_file_dep(self, fs: &FileSystem) -> FileDep {
+        let src = self.src.into_file_endoint(fs);
+        let tgt = self.tgt.into_file_endoint(fs);
         let position = src.position;
         FileDep::new(src, tgt, self.kind, position)
     }
@@ -156,7 +156,8 @@ struct DependsEndpoint {
 }
 
 impl DependsEndpoint {
-    fn into_file_endoint(self) -> FileEndpoint {
-        FileEndpoint::new(self.filename, PartialPosition::Row(self.line - 1))
+    fn into_file_endoint(self, fs: &FileSystem) -> FileEndpoint {
+        let file_key = fs.get_key_for_filename(self.filename).unwrap();
+        FileEndpoint::new(file_key.clone(), PartialPosition::Row(self.line - 1))
     }
 }

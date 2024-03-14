@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -17,9 +16,10 @@ use git2::TreeWalkMode;
 use git2::TreeWalkResult;
 use walkdir::WalkDir;
 
+use crate::changes::DiffCalculator;
 use crate::core::ContentId;
+use crate::core::FileFilter;
 use crate::core::FileKey;
-use crate::core::Lang;
 
 #[derive(Clone)]
 pub struct FileSystem {
@@ -28,19 +28,19 @@ pub struct FileSystem {
 }
 
 impl FileSystem {
-    fn disk<P: AsRef<Path>>(root: P, langs: &HashSet<Lang>) -> Result<Self> {
+    fn disk<P: AsRef<Path>>(root: P, filter: &FileFilter) -> Result<Self> {
         let inner = FileSystemInner::Disk(DiskStorage::new(root));
-        let file_keys = FileKeySet::new(inner.list(langs)?)?;
+        let file_keys = FileKeySet::new(inner.list(filter)?)?;
         Ok(Self { inner, file_keys })
     }
 
-    fn git<S: AsRef<str>>(repo: Repository, commit: S, langs: &HashSet<Lang>) -> Result<Self> {
+    fn git<S: AsRef<str>>(repo: Repository, commit: S, filter: &FileFilter) -> Result<Self> {
         let inner = FileSystemInner::Git(GitStorage::new(repo), commit.as_ref().to_string());
-        let file_keys = FileKeySet::new(inner.list(langs)?)?;
+        let file_keys = FileKeySet::new(inner.list(filter)?)?;
         Ok(Self { inner, file_keys })
     }
 
-    pub fn open<P, S>(root: P, commit: &Option<S>, langs: &HashSet<Lang>) -> Result<Self>
+    pub fn open<P, S>(root: P, commit: &Option<S>, filter: &FileFilter) -> Result<Self>
     where
         P: AsRef<Path>,
         S: AsRef<str>,
@@ -48,10 +48,10 @@ impl FileSystem {
         let repo = Repository::open(&root).ok();
         let msg = "a commit was supplied but the project root does not refer to a git repository";
         match (repo, commit.as_ref()) {
-            (None, None) => Self::disk(root, langs),
+            (None, None) => Self::disk(root, filter),
             (None, Some(_)) => bail!(msg),
-            (Some(_), None) => Self::disk(root, langs),
-            (Some(repo), Some(commit)) => Self::git(repo, commit, langs),
+            (Some(_), None) => Self::disk(root, filter),
+            (Some(repo), Some(commit)) => Self::git(repo, commit, filter),
         }
     }
 
@@ -67,24 +67,22 @@ impl FileSystem {
         self.inner.load_into_buf(key, buf)
     }
 
-    pub fn get_by_filename<F: AsRef<str>>(&self, filename: F) -> Result<&FileKey> {
+    #[allow(dead_code)]
+    pub fn load_by_filename<F: AsRef<str>>(&self, filename: F) -> Result<Vec<u8>> {
+        self.load(self.get_key_for_filename(filename)?)
+    }
+
+    pub fn get_key_for_filename<F: AsRef<str>>(&self, filename: F) -> Result<&FileKey> {
         self.file_keys.get_by_filename(&filename).with_context(|| {
             format!("no file named '{}' found in this filesystem", filename.as_ref())
         })
     }
 
-    pub fn load_by_filename<F: AsRef<str>>(&self, filename: F) -> Result<Vec<u8>> {
-        self.load(self.get_by_filename(filename)?)
-    }
-
-    fn get_by_content_id(&self, content_id: &ContentId) -> Result<&FileKey> {
-        self.file_keys.get_by_content_id(content_id).with_context(|| {
-            format!("no files with content id '{}' found in this filesystem", content_id)
-        })
-    }
-
-    pub fn load_by_content_id(&self, content_id: &ContentId) -> Result<Vec<u8>> {
-        self.load(self.get_by_content_id(content_id)?)
+    pub fn diff_calculator(&self) -> Option<DiffCalculator> {
+        match &self.inner {
+            FileSystemInner::Disk(_) => None,
+            FileSystemInner::Git(git, _) => Some(DiffCalculator::new(git.repo.clone())),
+        }
     }
 }
 
@@ -95,10 +93,10 @@ enum FileSystemInner {
 }
 
 impl FileSystemInner {
-    fn list(&self, langs: &HashSet<Lang>) -> Result<Vec<FileKey>> {
+    fn list(&self, filter: &FileFilter) -> Result<Vec<FileKey>> {
         match self {
-            FileSystemInner::Disk(fs) => fs.list(langs),
-            FileSystemInner::Git(fs, commit) => fs.list(langs, commit),
+            FileSystemInner::Disk(fs) => fs.list(filter),
+            FileSystemInner::Git(fs, commit) => fs.list(commit, filter),
         }
     }
 
@@ -109,7 +107,7 @@ impl FileSystemInner {
         }
     }
 
-    pub fn load_into_buf(&self, key: &FileKey, buf: &mut Vec<u8>) -> Result<usize> {
+    fn load_into_buf(&self, key: &FileKey, buf: &mut Vec<u8>) -> Result<usize> {
         match self {
             FileSystemInner::Disk(fs) => fs.load_into_buf(&key.filename, buf),
             FileSystemInner::Git(fs, _) => fs.load_into_buf(&key.content_id, buf),
@@ -127,7 +125,7 @@ impl DiskStorage {
         Self { root: root.as_ref().to_path_buf() }
     }
 
-    fn list(&self, langs: &HashSet<Lang>) -> Result<Vec<FileKey>> {
+    fn list(&self, filter: &FileFilter) -> Result<Vec<FileKey>> {
         let mut keys = Vec::new();
 
         for entry in WalkDir::new(&self.root).follow_links(true) {
@@ -135,9 +133,9 @@ impl DiskStorage {
                 Ok(entry) => {
                     let path = entry.path().strip_prefix(&self.root)?.to_string_lossy().to_string();
 
-                    if is_lang_enabled(&path, langs) {
+                    if filter.includes(&path) {
                         let oid = Oid::hash_file(ObjectType::Blob, &path)?;
-                        keys.push(FileKey::new(path, to_content_id(oid)));
+                        keys.push(FileKey::new(path, oid.into()));
                     }
                 }
                 Err(err) => {
@@ -155,7 +153,7 @@ impl DiskStorage {
         Ok(buf)
     }
 
-    pub fn load_into_buf<F: AsRef<Path>>(&self, filename: F, buf: &mut Vec<u8>) -> Result<usize> {
+    fn load_into_buf<F: AsRef<Path>>(&self, filename: F, buf: &mut Vec<u8>) -> Result<usize> {
         Ok(File::open(self.root.join(filename))?.read_to_end(buf)?)
     }
 }
@@ -172,7 +170,7 @@ impl GitStorage {
         Self { repo: Arc::new(Mutex::new(repo)) }
     }
 
-    fn list<S: AsRef<str>>(&self, langs: &HashSet<Lang>, commit: S) -> Result<Vec<FileKey>> {
+    fn list<S: AsRef<str>>(&self, commit: S, filter: &FileFilter) -> Result<Vec<FileKey>> {
         let mut keys = Vec::new();
 
         let repo = self.repo.lock().unwrap();
@@ -189,8 +187,8 @@ impl GitStorage {
         commit.tree()?.walk(TreeWalkMode::PreOrder, |dir, entry| {
             let path = dir.to_string() + entry.name().unwrap();
 
-            if is_lang_enabled(&path, langs) {
-                keys.push(FileKey::new(path, to_content_id(entry.id())));
+            if filter.includes(&path) {
+                keys.push(FileKey::new(path, entry.id().into()));
             }
 
             TreeWalkResult::Ok
@@ -199,13 +197,13 @@ impl GitStorage {
         Ok(keys)
     }
 
-    fn load(&self, content_id: &ContentId) -> Result<Vec<u8>> {
-        Ok(self.repo.try_lock().unwrap().find_blob(content_id.to_oid())?.content().to_owned())
+    fn load(&self, blob_id: &ContentId) -> Result<Vec<u8>> {
+        Ok(self.repo.try_lock().unwrap().find_blob(blob_id.to_oid())?.content().to_owned())
     }
 
-    fn load_into_buf(&self, content_id: &ContentId, buf: &mut Vec<u8>) -> Result<usize> {
+    fn load_into_buf(&self, blob_id: &ContentId, buf: &mut Vec<u8>) -> Result<usize> {
         let repo = self.repo.try_lock().unwrap();
-        let blob = repo.find_blob(content_id.to_oid())?;
+        let blob = repo.find_blob(blob_id.to_oid())?;
         let slice = blob.content();
         buf.extend_from_slice(slice);
         Ok(slice.len())
@@ -216,50 +214,27 @@ impl GitStorage {
 struct FileKeySet {
     file_keys: Vec<FileKey>,
     filenames: HashMap<String, usize>,
-    content_ids: HashMap<ContentId, Vec<usize>>,
 }
 
 impl FileKeySet {
-    pub fn new(mut file_keys: Vec<FileKey>) -> Result<Self> {
+    fn new(mut file_keys: Vec<FileKey>) -> Result<Self> {
         let mut filenames = HashMap::with_capacity(file_keys.len());
-        let mut content_ids: HashMap<ContentId, Vec<usize>> =
-            HashMap::with_capacity(file_keys.len());
-
         file_keys.sort();
 
         for (i, file_key) in file_keys.iter().enumerate() {
             if let Some(_) = filenames.insert(file_key.filename.clone(), i) {
                 bail!("filenames must be unique");
             }
-
-            if let Some(indices) = content_ids.get_mut(&file_key.content_id) {
-                indices.push(i);
-            } else {
-                content_ids.insert(file_key.content_id, vec![i]);
-            }
         }
 
-        Ok(Self { file_keys, filenames, content_ids })
+        Ok(Self { file_keys, filenames })
     }
 
-    pub fn file_keys(&self) -> &[FileKey] {
+    fn file_keys(&self) -> &[FileKey] {
         &self.file_keys
     }
 
-    pub fn get_by_filename<S: AsRef<str>>(&self, filename: S) -> Option<&FileKey> {
+    fn get_by_filename<S: AsRef<str>>(&self, filename: S) -> Option<&FileKey> {
         self.filenames.get(filename.as_ref()).map(|&i| &self.file_keys[i])
     }
-
-    // Get an ARBITRARY FileKey with the given content_id
-    pub fn get_by_content_id(&self, content_id: &ContentId) -> Option<&FileKey> {
-        self.content_ids.get(content_id).map(|indices| &self.file_keys[indices[0]])
-    }
-}
-
-fn is_lang_enabled(filename: &str, langs: &HashSet<Lang>) -> bool {
-    Lang::from_filename(filename).map(|l| langs.contains(&l)).is_some()
-}
-
-fn to_content_id(oid: Oid) -> ContentId {
-    unsafe { std::mem::transmute(oid) }
 }

@@ -2,12 +2,14 @@
 #[macro_use]
 extern crate derive_builder;
 
-use core::Entity;
-use core::EntityDep;
-use core::EntityId;
+use core::CommitId;
+use core::Diff;
 use core::FileDep;
 use core::FileKey;
 use core::Lang;
+use core::Tag;
+use core::TagDep;
+use core::TagId;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -22,23 +24,24 @@ use std::thread::available_parallelism;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use clap::Args;
 use clap::Parser;
-use clap::Subcommand;
 use clap::ValueEnum;
 use clap_verbosity_flag::InfoLevel;
 use clap_verbosity_flag::Verbosity;
-use entities::extract_entity_set;
-use entities::EntitySet;
+use counter::Counter;
+use entities::extract_tag_set;
+use entities::TagSet;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
 
+use crate::core::Change;
+use crate::core::EntityId;
+use crate::core::FileFilter;
 use crate::depends::Depends;
 use crate::loading::FileSystem;
 use crate::output::OutputV1;
@@ -48,6 +51,7 @@ use crate::stackgraphs::resolve;
 use crate::storage::LoadResponse;
 use crate::storage::Store;
 
+mod changes;
 mod core;
 mod depends;
 mod entities;
@@ -92,17 +96,51 @@ struct Cli {
     #[arg(short, long, value_delimiter = ' ', default_values_t = EnabledLang::all())]
     langs: Vec<EnabledLang>,
 
+    /// Method to use to resolve dependencies between files or entities when
+    /// needed
+    #[arg(long, default_value_t = Resolver::StackGraphs)]
+    resolver: Resolver,
+
+    /// Extract entities and dependencies from this commit instead of the files
+    /// on disk
+    ///
+    /// If not specified, will scan recursively from the project root. Can be a
+    /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
+    #[arg(long)]
+    commit: Option<String>,
+
+    /// Enable history extraction
+    ///
+    /// May optionally provide a newline delimited list of commits (specified as
+    /// SHA-1 hashes) where change information will be extracted from. If not
+    /// provided, will scan all commits reachable from `--commit`. If `--commit`
+    /// has not been specified, will scan all commits reachable from HEAD.
+    ///
+    /// This option is intended to work with git rev-list. For instance
+    /// `--history="$(git rev-list --since=1year HEAD)"` will include all
+    /// commits from the past year that are reachable from HEAD.
+    ///
+    /// Can also load a list of commits from a file, e.g.,
+    /// `--history=history.txt`
+    #[arg(long)]
+    history: Option<Option<String>>,
+
+    /// Method to use to resolve dependencies between files or entities
+    #[arg(long, default_value_t = DumpFormat::JsonV2)]
+    format: DumpFormat,
+
+    /// Name field in JSONv1 output
+    ///
+    /// Defaults to the last component of the project root.
+    #[arg(long)]
+    name: Option<String>,
+
     /// Number of threads to use when processing files
     ///
     /// If 0, this will be set automatically (typically as the number of CPU
     /// cores)
     #[arg(short, long, default_value_t = 0)]
     num_threads: usize,
-
-    /// Method to use to resolve dependencies between files or entities when
-    /// needed
-    #[arg(long, default_value_t = Resolver::StackGraphs)]
-    resolver: Resolver,
 
     /// Path to the depends.jar that is used for Depends dependency resolution
     ///
@@ -126,59 +164,6 @@ struct Cli {
 
     #[command(flatten)]
     verbose: Verbosity<InfoLevel>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    Dump(DumpCommand),
-    LsEntities(LsEntitiesCommand),
-    LsDeps(LsDepsCommand),
-}
-
-/// Export files and dependencies as DV8 JSON
-#[derive(Debug, Args)]
-struct DumpCommand {
-    /// A commit to scan instead of the files on disk
-    ///
-    /// If not specified, will scan recursively from the project root. Can be a
-    /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
-    #[arg(long)]
-    commit: Option<String>,
-
-    /// Method to use to resolve dependencies between files or entities
-    #[arg(long, default_value_t = DumpFormat::JsonV2)]
-    format: DumpFormat,
-
-    /// Name field in JSON output
-    ///
-    /// Defaults to the last component of the project root.
-    #[arg(long)]
-    name: Option<String>,
-}
-
-/// List all entities found
-#[derive(Debug, Args)]
-struct LsEntitiesCommand {
-    /// Read entities from this commit instead of disk
-    ///
-    /// If not specified, will scan recursively from the project root. Can be a
-    /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
-    #[arg(long)]
-    commit: Option<String>,
-}
-
-/// List all dependencies found
-#[derive(Debug, Args)]
-struct LsDepsCommand {
-    /// Read dependencies from this commit instead of disk
-    ///
-    /// If not specified, will scan recursively from the project root. Can be a
-    /// reference (e.g. "main", "origin/main", etc.) or a SHA-1 hash.
-    #[arg(long)]
-    commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -239,7 +224,6 @@ impl Display for Resolver {
 enum DumpFormat {
     JsonV1,
     JsonV2,
-    Sqlite,
 }
 
 impl Display for DumpFormat {
@@ -247,7 +231,6 @@ impl Display for DumpFormat {
         match self {
             Self::JsonV1 => write!(f, "jsonv1"),
             Self::JsonV2 => write!(f, "jsonv2"),
-            Self::Sqlite => write!(f, "sqlite"),
         }
     }
 }
@@ -257,21 +240,18 @@ fn project_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn cache_dir<P: AsRef<Path>>(cache_dir: Option<PathBuf>, project_root: P) -> Result<PathBuf> {
-    Ok(cache_dir.unwrap_or_else(|| {
-        let git_dir = project_root.as_ref().join(".git");
-        let preferred = git_dir.join(DEFAULT_CACHE_DIR);
-        let fallback = project_root.as_ref().join(DEFAULT_CACHE_DIR);
+    Ok(cache_dir.unwrap_or_else(|| project_root.as_ref().join(DEFAULT_CACHE_DIR)))
+}
 
-        if preferred.exists() {
-            preferred
-        } else if fallback.exists() {
-            fallback
-        } else if git_dir.exists() {
-            preferred
-        } else {
-            fallback
-        }
-    }))
+fn history(history: Option<Option<String>>) -> Option<Vec<CommitId>> {
+    history.map(|x| x.iter().flat_map(|x| x.lines().flat_map(CommitId::from_str)).collect())
+}
+
+fn num_threads(num_threads: usize) -> Result<NonZeroUsize> {
+    Ok(match NonZeroUsize::new(num_threads) {
+        Some(n) => n,
+        _ => available_parallelism()?,
+    })
 }
 
 fn name<P: AsRef<Path>>(name: Option<String>, project_root: P) -> String {
@@ -285,29 +265,27 @@ fn name<P: AsRef<Path>>(name: Option<String>, project_root: P) -> String {
     })
 }
 
-fn num_threads(num_threads: usize) -> Result<NonZeroUsize> {
-    Ok(match NonZeroUsize::new(num_threads) {
-        Some(n) => n,
-        _ => available_parallelism()?,
-    })
-}
-
-struct CommonArgs {
+struct ProcessedCli {
     project_root: PathBuf,
     cache_dir: PathBuf,
     clean: bool,
     langs: HashSet<Lang>,
-    num_threads: NonZeroUsize,
     resolver: Resolver,
+    commit: Option<String>,
+    history: Option<Vec<CommitId>>,
+    format: DumpFormat,
+    name: String,
+    num_threads: NonZeroUsize,
     depends_jar: Option<PathBuf>,
     depends_java: Option<PathBuf>,
     depends_xmx: Option<String>,
 }
 
-impl CommonArgs {
+impl ProcessedCli {
     fn from(cli: &Cli) -> Result<Self> {
         let project_root = project_root(cli.project_root.clone())?;
         let cache_dir = cache_dir(cli.cache_dir.clone(), &project_root)?;
+        let name = name(cli.name.clone(), &project_root);
         let num_threads = num_threads(cli.num_threads)?;
 
         Ok(Self {
@@ -315,8 +293,12 @@ impl CommonArgs {
             cache_dir,
             clean: cli.clean,
             langs: cli.langs.iter().map_into().collect(),
-            num_threads,
             resolver: cli.resolver,
+            commit: cli.commit.clone(),
+            history: history(cli.history.clone()),
+            format: cli.format,
+            name,
+            num_threads,
             depends_jar: cli.depends_jar.clone(),
             depends_java: cli.depends_java.clone(),
             depends_xmx: Some(cli.depends_xmx.clone()),
@@ -327,7 +309,7 @@ impl CommonArgs {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let logger = env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).build();
-    let args = CommonArgs::from(&cli)?;
+    let args = ProcessedCli::from(&cli)?;
     let multi_progress = MultiProgress::new();
     LogWrapper::new(multi_progress.clone(), logger).try_init().unwrap();
 
@@ -338,112 +320,118 @@ fn main() -> anyhow::Result<()> {
 
     let start = Instant::now();
 
-    match cli.command {
-        Command::Dump(cmd) => dump(args, cmd, multi_progress),
-        Command::LsEntities(cmd) => ls_entities(args, cmd),
-        Command::LsDeps(cmd) => ls_deps(args, cmd, multi_progress),
-    }?;
+    let filter = FileFilter::from_langs(args.langs.clone());
+    let fs = FileSystem::open(&args.project_root, &args.commit, &filter)?;
+    let deps = collect_file_deps(&args, fs.clone(), multi_progress)?;
 
-    log::info!("Finished in {}ms.", start.elapsed().as_millis());
-    Ok(())
-}
+    let mut sets = collect_tag_sets(fs.clone());
+    let mut changes = Vec::new();
 
-fn dump(args: CommonArgs, cmd: DumpCommand, progress: MultiProgress) -> anyhow::Result<()> {
-    let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
+    if let Some(history) = args.history {
+        let dc = fs.diff_calculator().expect("must be a git repository to use `--history` flag");
+        let filter = FileFilter::from_filenames(fs.list().iter().map(|f| f.filename.clone()));
+        let diffs = history.into_iter().flat_map(|c| dc.diff(c, &filter).unwrap()).collect_vec();
+        changes.extend(collect_changes(&fs, &mut sets, diffs));
+    }
 
-    let deps = collect_file_deps(&args, fs.clone(), progress)?;
-    let name = name(cmd.name, &args.project_root);
-
-    let text = match cmd.format {
+    let text = match args.format {
         DumpFormat::JsonV1 => {
             let filenames = fs.list().iter().map(|k| k.filename.clone()).collect();
-            let output = OutputV1::build(&name, filenames, deps)?;
+            let output = OutputV1::build(&args.name, filenames, deps)?;
             serde_json::to_string_pretty(&output)?
         }
         DumpFormat::JsonV2 => {
-            let entity_sets = collect_entity_sets(fs);
-            let entities = flatten_entity_sets(&entity_sets);
-            let deps = to_entity_deps(&deps, &entity_sets);
-            let output = OutputV2::build(&name, entities, deps)?;
+            let deps = to_tag_deps(&deps, &sets);
+            let tags = flatten_tag_sets(&sets);
+            let changes = to_tag_changes(&tags, &changes);
+            let output = OutputV2::build(tags, deps, changes)?;
             serde_json::to_string_pretty(&output)?
-        }
-        DumpFormat::Sqlite => {
-            bail!("sqlite output not yet suppported");
         }
     };
 
     log::info!("Writing output...");
     println!("{}", text);
+    log::info!("Finished in {}ms.", start.elapsed().as_millis());
     Ok(())
 }
 
-fn ls_entities(args: CommonArgs, cmd: LsEntitiesCommand) -> anyhow::Result<()> {
-    let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
-    let entity_sets = collect_entity_sets(fs);
-    let entities = flatten_entity_sets(&entity_sets);
+fn to_tag_changes(tags: &[Tag], changes: &[Change<EntityId>]) -> Vec<Change<TagId>> {
+    let mut tag_changes = Vec::new();
+    let lookup = tags.iter().map(|t| (t.entity.id, t.id)).into_group_map();
 
-    for entity in &entities {
-        println!("{}", serde_json::to_string(entity)?);
-    }
-
-    Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, serde::Serialize)]
-struct DepDto {
-    src_id: EntityId,
-    tgt_id: EntityId,
-    kind: String,
-    byte: usize,
-}
-
-fn ls_deps(args: CommonArgs, cmd: LsDepsCommand, progress: MultiProgress) -> anyhow::Result<()> {
-    let fs = FileSystem::open(&args.project_root, &cmd.commit, &args.langs)?;
-
-    let deps = collect_file_deps(&args, fs.clone(), progress)?;
-    let entity_sets = collect_entity_sets(fs.clone());
-
-    for dep in to_entity_deps(&deps, &entity_sets) {
-        if !dep.is_loop() {
-            println!("{}", serde_json::to_string(&dep)?);
+    for change in changes {
+        if let Some(tag_ids) = lookup.get(&change.target_id) {
+            for tag_id in tag_ids {
+                tag_changes.push(change.with_id(*tag_id));
+            }
         }
     }
 
-    Ok(())
+    tag_changes
 }
 
-fn flatten_entity_sets(entity_sets: &HashMap<String, EntitySet>) -> Vec<Entity> {
-    let mut entities = Vec::new();
+fn collect_changes(
+    fs: &FileSystem,
+    sets: &mut HashMap<FileKey, TagSet>,
+    diffs: Vec<Diff>,
+) -> Vec<Change<EntityId>> {
+    let mut changes = Vec::new();
 
-    for filename in entity_sets.keys().sorted() {
-        for entity in entity_sets[filename].entities() {
-            entities.push(entity.clone());
+    for diff in diffs {
+        let change_kind = diff.change_kind();
+
+        let old_counts: Counter<EntityId> = diff
+            .old
+            .map(|k| sets.entry(k.clone()).or_insert_with_key(|k| extract_tag_set(&fs, k)))
+            .into_iter()
+            .flat_map(|s| diff.hunks.iter().flat_map(|h| s.find_entity_ids(h.old)))
+            .collect();
+
+        let new_counts: Counter<EntityId> = diff
+            .new
+            .map(|k| sets.entry(k.clone()).or_insert_with_key(|k| extract_tag_set(&fs, k)))
+            .into_iter()
+            .flat_map(|s| diff.hunks.iter().flat_map(|h| s.find_entity_ids(h.new)))
+            .collect();
+
+        for id in old_counts.keys().chain(new_counts.keys()).unique() {
+            let dels = old_counts[id];
+            let adds = new_counts[id];
+            changes.push(Change::new(*id, diff.commit_id, change_kind, adds, dels));
         }
     }
 
-    entities
+    changes
 }
 
-fn collect_entity_sets(fs: FileSystem) -> HashMap<String, EntitySet> {
+fn flatten_tag_sets(tag_sets: &HashMap<FileKey, TagSet>) -> Vec<Tag> {
+    let mut tags = Vec::new();
+
+    for file_key in tag_sets.keys().sorted() {
+        for tag in tag_sets[file_key].tags() {
+            tags.push(tag.clone());
+        }
+    }
+
+    tags
+}
+
+fn collect_tag_sets(fs: FileSystem) -> HashMap<FileKey, TagSet> {
     let mut map = HashMap::with_capacity(fs.list().len());
 
     for key in fs.list() {
-        if let Some(entity_set) = extract_entity_set(fs.clone(), &key.filename) {
-            map.insert(key.filename.clone(), entity_set);
-        } else {
-            log::warn!("Failed to extract entities from {}", key.filename);
-        }
+        map.insert(key.clone(), extract_tag_set(&fs, key));
     }
 
     map
 }
 
-fn to_entity_deps(deps: &[FileDep], entity_sets: &HashMap<String, EntitySet>) -> Vec<EntityDep> {
+fn to_tag_deps(deps: &[FileDep], entity_sets: &HashMap<FileKey, TagSet>) -> Vec<TagDep> {
     let mut entity_deps = Vec::new();
 
     for dep in deps {
-        let src_set = entity_sets.get(&dep.src.filename);
-        let tgt_set = entity_sets.get(&dep.tgt.filename);
+        let src_set = entity_sets.get(&dep.src.file_key);
+        let tgt_set = entity_sets.get(&dep.tgt.file_key);
 
         if src_set.is_none() || tgt_set.is_none() {
             continue;
@@ -460,7 +448,7 @@ fn to_entity_deps(deps: &[FileDep], entity_sets: &HashMap<String, EntitySet>) ->
 }
 
 fn collect_file_deps(
-    args: &CommonArgs,
+    args: &ProcessedCli,
     fs: FileSystem,
     progress: MultiProgress,
 ) -> Result<Vec<FileDep>> {
@@ -470,7 +458,7 @@ fn collect_file_deps(
             args.depends_java.clone(),
             args.depends_xmx.clone(),
         )
-        .resolve(fs)?,
+        .resolve(&fs)?,
         Resolver::StackGraphs => {
             let (deps, _) =
                 collect_file_deps_sg(fs, &args.cache_dir, args.num_threads.into(), progress)?;
@@ -547,7 +535,7 @@ fn collect_file_deps_sg(
     }
 
     log::info!("Resolving all references...");
-    Ok((resolve(&mut ctx), failures))
+    Ok((resolve(&mut ctx, &fs), failures))
 }
 
 fn num_per_thread(num_threads: usize, total: usize) -> usize {

@@ -38,10 +38,10 @@ lazy_static = "1.4.0"
 tree-sitter = { version = "0.20.10", features = ["lazy_static"] }
 derive_builder = "0.13.0"
 sha1 = "0.10.6"
-slotmap = { version = "1.0.7", features = ["serde"] }
 strum = { version = "0.26.1", features = ["derive"] }
 strum_macros = "0.26"
 hex = "0.4"
 rocksdb = "0.21.0"
 subprocess = "0.2.9"
 tempfile = "3.10.1"
+counter = "0.5.7"

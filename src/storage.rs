@@ -55,7 +55,7 @@ impl Store {
                     failures.insert(key.clone());
                 }
             } else {
-                bail!("no value found for {}", key);
+                bail!("no value found for {:?}", key);
             }
         }
 

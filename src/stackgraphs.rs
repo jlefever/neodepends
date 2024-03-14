@@ -22,6 +22,7 @@ use crate::core::FileEndpoint;
 use crate::core::Lang;
 use crate::core::PartialPosition;
 use crate::core::Span;
+use crate::loading::FileSystem;
 
 static BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
@@ -191,7 +192,7 @@ impl StackGraphCtx {
     }
 }
 
-pub fn resolve(ctx: &mut StackGraphCtx) -> Vec<FileDep> {
+pub fn resolve(ctx: &mut StackGraphCtx, fs: &FileSystem) -> Vec<FileDep> {
     let mut references = Vec::new();
 
     let mut db = Database::new();
@@ -211,6 +212,7 @@ pub fn resolve(ctx: &mut StackGraphCtx) -> Vec<FileDep> {
     );
 
     let filename = |n: Handle<Node>| ctx.graph[ctx.graph[n].file().unwrap()].name().to_string();
+    let file_key = |n: Handle<Node>| fs.get_key_for_filename(filename(n)).unwrap().clone();
     let position = |n: Handle<Node>| {
         PartialPosition::Whole(Span::from_lsp(&ctx.graph.source_info(n).unwrap().span).start)
     };
@@ -220,8 +222,8 @@ pub fn resolve(ctx: &mut StackGraphCtx) -> Vec<FileDep> {
         .map(|r| {
             let start_node_pos = position(r.start_node);
             Dep::new(
-                FileEndpoint::new(filename(r.start_node), start_node_pos),
-                FileEndpoint::new(filename(r.end_node), position(r.end_node)),
+                FileEndpoint::new(file_key(r.start_node), start_node_pos),
+                FileEndpoint::new(file_key(r.end_node), position(r.end_node)),
                 DepKind::Use,
                 start_node_pos,
             )

@@ -6,11 +6,14 @@ use anyhow::Result;
 use itertools::Itertools;
 use serde::Serialize;
 
+use crate::core::Change;
 use crate::core::DepKind;
-use crate::core::Entity;
-use crate::core::EntityDep;
-use crate::core::EntityId;
+use crate::core::EntityKind;
 use crate::core::FileDep;
+use crate::core::Span;
+use crate::core::Tag;
+use crate::core::TagDep;
+use crate::core::TagId;
 
 #[derive(Serialize)]
 pub struct OutputV1 {
@@ -23,7 +26,10 @@ pub struct OutputV1 {
 impl OutputV1 {
     pub fn build(name: &str, filenames: HashSet<String>, deps: Vec<FileDep>) -> Result<Self> {
         for dep in &deps {
-            if !filenames.contains(&dep.src.filename) || !filenames.contains(&dep.tgt.filename) {
+            let src_filename = &dep.src.file_key.filename;
+            let tgt_filename = &dep.tgt.file_key.filename;
+
+            if !filenames.contains(src_filename) || !filenames.contains(tgt_filename) {
                 bail!("filename not found");
             }
         }
@@ -35,8 +41,8 @@ impl OutputV1 {
         let mut cells: HashMap<(usize, usize), CellV1> = HashMap::new();
 
         for dep in deps.iter().sorted().filter(|d| !d.is_loop()) {
-            let src_ix = *lookup.get(&dep.src.filename).unwrap();
-            let tgt_ix = *lookup.get(&dep.tgt.filename).unwrap();
+            let src_ix = *lookup.get(&dep.src.file_key.filename).unwrap();
+            let tgt_ix = *lookup.get(&dep.tgt.file_key.filename).unwrap();
 
             if let Some(cell) = cells.get_mut(&(src_ix, tgt_ix)) {
                 cell.increment(dep.kind);
@@ -78,22 +84,23 @@ impl CellV1 {
 #[derive(Serialize)]
 pub struct OutputV2 {
     schema: String,
-    name: String,
-    entities: Vec<Entity>,
+    entities: Vec<TagRes>,
     cells: Vec<CellV2>,
+    changes: Vec<Change<TagId>>,
 }
 
 impl OutputV2 {
-    pub fn build(name: &str, entities: Vec<Entity>, deps: Vec<EntityDep>) -> Result<Self> {
-        let entities_set = entities.iter().map(|e| e.id).collect::<HashSet<_>>();
+    pub fn build(tags: Vec<Tag>, deps: Vec<TagDep>, changes: Vec<Change<TagId>>) -> Result<Self> {
+        let tags = tags.into_iter().map(|t| TagRes::from_tag(t)).collect_vec();
+        let ids = tags.iter().map(|t| t.id).collect::<HashSet<_>>();
 
         for dep in &deps {
-            if !entities_set.contains(&dep.src) || !entities_set.contains(&dep.tgt) {
-                bail!("entity not found");
+            if !ids.contains(&dep.src) || !ids.contains(&dep.tgt) {
+                bail!("tag not found");
             }
         }
 
-        let mut cells: HashMap<(EntityId, EntityId), CellV2> = HashMap::new();
+        let mut cells: HashMap<(TagId, TagId), CellV2> = HashMap::new();
 
         for dep in deps.iter().sorted().filter(|d| !d.is_loop()) {
             if let Some(cell) = cells.get_mut(&(dep.src, dep.tgt)) {
@@ -108,19 +115,40 @@ impl OutputV2 {
         let cells =
             cells.into_iter().sorted_by_key(|(k, _)| k.clone()).map(|(_, c)| c).collect_vec();
 
-        Ok(Self { schema: "2.0".to_string(), name: name.to_string(), entities, cells })
+        Ok(Self { schema: "2.0".to_string(), entities: tags, cells, changes })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+struct TagRes {
+    id: TagId,
+    parent_id: Option<TagId>,
+    name: String,
+    kind: EntityKind,
+    location: Span,
+}
+
+impl TagRes {
+    fn from_tag(tag: Tag) -> Self {
+        Self {
+            id: tag.id,
+            parent_id: tag.parent_id,
+            name: tag.entity.name,
+            kind: tag.entity.kind,
+            location: tag.location,
+        }
     }
 }
 
 #[derive(Serialize)]
 struct CellV2 {
-    src: EntityId,
-    dst: EntityId,
+    src: TagId,
+    dst: TagId,
     values: HashMap<DepKind, usize>,
 }
 
 impl CellV2 {
-    fn new(src: EntityId, dst: EntityId) -> Self {
+    fn new(src: TagId, dst: TagId) -> Self {
         Self { src, dst, values: HashMap::new() }
     }
 
