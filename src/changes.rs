@@ -9,9 +9,9 @@ use itertools::Itertools;
 
 use crate::core::CommitId;
 use crate::core::Diff;
-use crate::core::FileFilter;
 use crate::core::FileKey;
 use crate::core::Hunk;
+use crate::loading::FileFilter;
 
 #[derive(Clone)]
 pub struct DiffCalculator {

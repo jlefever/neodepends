@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
@@ -12,10 +13,10 @@ use subprocess::Exec;
 use subprocess::Redirection;
 use tempfile::TempDir;
 
-use crate::core::DepKind;
 use crate::core::FileDep;
 use crate::core::FileEndpoint;
 use crate::core::PartialPosition;
+use crate::languages::Lang;
 use crate::loading::FileSystem;
 
 pub struct Depends {
@@ -33,14 +34,17 @@ impl Depends {
         log::info!("Copying relevent source files to a temp directory for Depends...");
         let work_dir = TempDir::new()?;
         copy_to_dir(fs, &work_dir)?;
-        log::info!("Running Depends...");
-        self.run(&work_dir)?;
-        log::info!("Collecting Depends output and removing temp directory...");
-        let deps = load_depends_output(&work_dir)?.iter_file_deps(fs).collect_vec();
+        let mut deps = Vec::new();
+        for lang in collect_langs(fs).into_iter().sorted() {
+            log::info!("Running Depends on {} files...", lang);
+            self.run(&work_dir, lang)?;
+            deps.extend(load_depends_output(&work_dir)?.iter_file_deps(fs));
+        }
+        log::info!("Removing temp directory...");
         Ok(deps)
     }
 
-    fn run<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
+    fn run<P: AsRef<Path>>(&self, dir: P, lang: &str) -> Result<()> {
         let mut cmd = Exec::cmd(self.java.clone().unwrap_or("java".into()));
 
         if let Some(xmx) = &self.xmx {
@@ -50,7 +54,7 @@ impl Depends {
         let status = cmd
             .arg("-jar")
             .arg(&get_depends_jar(self.jar.clone())?)
-            .arg("java")
+            .arg(lang)
             .arg(".")
             .arg("deps")
             .arg("--detail")
@@ -82,6 +86,20 @@ fn copy_to_dir<P: AsRef<Path>>(fs: &FileSystem, dir: P) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn collect_langs(fs: &FileSystem) -> HashSet<&'static str> {
+    let mut langs = HashSet::new();
+
+    for file_key in fs.list() {
+        if let Some(lang) = Lang::from_filename(&file_key.filename) {
+            if let Some(depends_lang) = lang.config().depends_lang {
+                langs.insert(depends_lang);
+            }
+        }
+    }
+
+    langs
 }
 
 fn load_depends_output<P: AsRef<Path>>(dir: P) -> Result<DependsOutput> {
@@ -134,7 +152,7 @@ struct DependsDetail {
     tgt: DependsEndpoint,
 
     #[serde(rename = "type")]
-    kind: DepKind,
+    kind: String,
 }
 
 impl DependsDetail {
@@ -142,7 +160,8 @@ impl DependsDetail {
         let src = self.src.into_file_endoint(fs);
         let tgt = self.tgt.into_file_endoint(fs);
         let position = src.position;
-        FileDep::new(src, tgt, self.kind, position)
+        let kind = self.kind.strip_suffix("(possible)").unwrap_or(&self.kind);
+        FileDep::new(src, tgt, kind.try_into().unwrap(), position)
     }
 }
 

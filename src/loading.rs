@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -16,10 +17,34 @@ use git2::TreeWalkMode;
 use git2::TreeWalkResult;
 use walkdir::WalkDir;
 
-use crate::changes::DiffCalculator;
 use crate::core::ContentId;
-use crate::core::FileFilter;
 use crate::core::FileKey;
+use crate::languages::Lang;
+
+#[derive(Debug, Clone)]
+pub enum FileFilter {
+    ByLang(HashSet<Lang>),
+    ByFilename(HashSet<String>),
+}
+
+impl FileFilter {
+    pub fn from_langs<I: IntoIterator<Item = Lang>>(langs: I) -> Self {
+        Self::ByLang(langs.into_iter().collect())
+    }
+
+    pub fn from_filenames<I: IntoIterator<Item = String>>(filenames: I) -> Self {
+        Self::ByFilename(filenames.into_iter().collect())
+    }
+
+    pub fn includes<S: AsRef<str>>(&self, filename: S) -> bool {
+        match self {
+            FileFilter::ByLang(langs) => {
+                Lang::from_filename(filename).map(|l| langs.contains(&l)).unwrap_or(false)
+            }
+            FileFilter::ByFilename(filenames) => filenames.contains(filename.as_ref()),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct FileSystem {
@@ -55,6 +80,13 @@ impl FileSystem {
         }
     }
 
+    pub fn repo(&self) -> Option<Arc<Mutex<Repository>>> {
+        match &self.inner {
+            FileSystemInner::Disk(_) => None,
+            FileSystemInner::Git(git, _) => Some(git.repo.clone())
+        }
+    }
+
     pub fn list(&self) -> &[FileKey] {
         self.file_keys.file_keys()
     }
@@ -76,13 +108,6 @@ impl FileSystem {
         self.file_keys.get_by_filename(&filename).with_context(|| {
             format!("no file named '{}' found in this filesystem", filename.as_ref())
         })
-    }
-
-    pub fn diff_calculator(&self) -> Option<DiffCalculator> {
-        match &self.inner {
-            FileSystemInner::Disk(_) => None,
-            FileSystemInner::Git(git, _) => Some(DiffCalculator::new(git.repo.clone())),
-        }
     }
 }
 
@@ -198,7 +223,7 @@ impl GitStorage {
     }
 
     fn load(&self, blob_id: &ContentId) -> Result<Vec<u8>> {
-        Ok(self.repo.try_lock().unwrap().find_blob(blob_id.to_oid())?.content().to_owned())
+        Ok(self.repo.lock().unwrap().find_blob(blob_id.to_oid())?.content().to_owned())
     }
 
     fn load_into_buf(&self, blob_id: &ContentId, buf: &mut Vec<u8>) -> Result<usize> {

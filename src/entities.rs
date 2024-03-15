@@ -5,7 +5,6 @@ use anyhow::Context;
 use anyhow::Result;
 use counter::Counter;
 use itertools::Itertools;
-use lazy_static::lazy_static;
 use tree_sitter::Language;
 use tree_sitter::Node;
 use tree_sitter::Parser;
@@ -18,7 +17,6 @@ use crate::core::EntityId;
 use crate::core::EntityKind;
 use crate::core::FileDep;
 use crate::core::FileKey;
-use crate::core::Lang;
 use crate::core::PartialPosition;
 use crate::core::PartialSpan;
 use crate::core::Position;
@@ -26,22 +24,17 @@ use crate::core::Span;
 use crate::core::Tag;
 use crate::core::TagDep;
 use crate::core::TagId;
+use crate::languages::Lang;
 use crate::loading::FileSystem;
 use crate::sparse_vec::SparseVec;
-use crate::stackgraphs::JAVA_SG;
-
-lazy_static! {
-    static ref JAVA_TAGGER: Tagger =
-        Tagger::new(JAVA_SG.language(), include_str!("../languages/java/tags.scm"));
-}
 
 pub fn extract_tag_set(fs: &FileSystem, file_key: &FileKey) -> TagSet {
     let lang = Lang::from_filename(&file_key.filename).unwrap();
     let source = &fs.load(file_key).unwrap();
     let filename = &file_key.filename;
 
-    let tag_set = match lang {
-        Lang::Java => JAVA_TAGGER.extract(source, filename).ok(),
+    let tag_set = match &lang.config().tag_query {
+        Some(query) => Tagger::new(lang.config().language, query).extract(source, filename).ok(),
         _ => Some(to_singleton_entity_set(source, filename).unwrap()),
     };
 
@@ -210,17 +203,15 @@ impl Capture {
     }
 }
 
-pub struct Tagger {
+pub struct Tagger<'a> {
     language: Language,
-    query: Query,
+    query: &'a Query,
     kinds: Vec<Option<EntityKind>>,
     name: u32,
 }
 
-impl Tagger {
-    pub fn new(language: Language, query: &str) -> Self {
-        let query = Query::new(language, query.as_ref()).context("failed to parse query").unwrap();
-
+impl<'a> Tagger<'a> {
+    pub fn new(language: Language, query: &'a Query) -> Self {
         let name = query.capture_index_for_name("name").unwrap();
 
         let kinds = query
@@ -278,6 +269,7 @@ fn collect_ancestor_ids(node: &Node) -> Vec<CaptureId> {
 }
 
 fn to_singleton_entity_set(source: &[u8], filename: &str) -> Result<TagSet> {
+    // I doubt this location calculation is correct...
     let text = String::from_utf8(source.to_vec())?;
     let mut newlines = Vec::new();
 
@@ -287,7 +279,7 @@ fn to_singleton_entity_set(source: &[u8], filename: &str) -> Result<TagSet> {
         }
     }
 
-    let end_byte = source.len() - 1;
+    let end_byte = source.len(); // or source.len() - 1?
     let end_row = newlines.len();
     let preceeding_length = newlines.last().map(|last| last + 1).unwrap_or(0);
     let end_column = source.len() - preceeding_length;

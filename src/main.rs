@@ -6,7 +6,6 @@ use core::CommitId;
 use core::Diff;
 use core::FileDep;
 use core::FileKey;
-use core::Lang;
 use core::Tag;
 use core::TagDep;
 use core::TagId;
@@ -38,11 +37,13 @@ use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use indicatif_log_bridge::LogWrapper;
 use itertools::Itertools;
+use languages::Lang;
 
+use crate::changes::DiffCalculator;
 use crate::core::Change;
 use crate::core::EntityId;
-use crate::core::FileFilter;
 use crate::depends::Depends;
+use crate::loading::FileFilter;
 use crate::loading::FileSystem;
 use crate::output::OutputV1;
 use crate::output::OutputV2;
@@ -55,6 +56,7 @@ mod changes;
 mod core;
 mod depends;
 mod entities;
+mod languages;
 mod loading;
 mod output;
 mod sparse_vec;
@@ -93,8 +95,8 @@ struct Cli {
     clean: bool,
 
     /// Enable the provided langauges
-    #[arg(short, long, value_delimiter = ' ', default_values_t = EnabledLang::all())]
-    langs: Vec<EnabledLang>,
+    #[arg(short, long, value_delimiter = ' ', default_values_t = Lang::all())]
+    langs: Vec<Lang>,
 
     /// Method to use to resolve dependencies between files or entities when
     /// needed
@@ -164,43 +166,6 @@ struct Cli {
 
     #[command(flatten)]
     verbose: Verbosity<InfoLevel>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "lower")]
-enum EnabledLang {
-    Java,
-    JavaScript,
-    Python,
-    TypeScript,
-}
-
-impl EnabledLang {
-    fn all() -> &'static [Self] {
-        &[Self::Java, Self::JavaScript, Self::Python, Self::TypeScript]
-    }
-}
-
-impl Display for EnabledLang {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Java => write!(f, "java"),
-            Self::JavaScript => write!(f, "javascript"),
-            Self::Python => write!(f, "python"),
-            Self::TypeScript => write!(f, "typescript"),
-        }
-    }
-}
-
-impl From<&EnabledLang> for Lang {
-    fn from(value: &EnabledLang) -> Self {
-        match value {
-            EnabledLang::Java => Self::Java,
-            EnabledLang::JavaScript => Self::JavaScript,
-            EnabledLang::Python => Self::Python,
-            EnabledLang::TypeScript => Self::TypeScript,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -285,6 +250,7 @@ impl ProcessedCli {
     fn from(cli: &Cli) -> Result<Self> {
         let project_root = project_root(cli.project_root.clone())?;
         let cache_dir = cache_dir(cli.cache_dir.clone(), &project_root)?;
+        let langs = cli.langs.iter().map(|&x| x).collect();
         let name = name(cli.name.clone(), &project_root);
         let num_threads = num_threads(cli.num_threads)?;
 
@@ -292,7 +258,7 @@ impl ProcessedCli {
             project_root,
             cache_dir,
             clean: cli.clean,
-            langs: cli.langs.iter().map_into().collect(),
+            langs: langs,
             resolver: cli.resolver,
             commit: cli.commit.clone(),
             history: history(cli.history.clone()),
@@ -328,7 +294,8 @@ fn main() -> anyhow::Result<()> {
     let mut changes = Vec::new();
 
     if let Some(history) = args.history {
-        let dc = fs.diff_calculator().expect("must be a git repository to use `--history` flag");
+        let repo = fs.repo().expect("must be a git repository to use `--history` flag");
+        let dc = DiffCalculator::new(repo);
         let filter = FileFilter::from_filenames(fs.list().iter().map(|f| f.filename.clone()));
         let diffs = history.into_iter().flat_map(|c| dc.diff(c, &filter).unwrap()).collect_vec();
         changes.extend(collect_changes(&fs, &mut sets, diffs));
@@ -501,13 +468,7 @@ fn collect_file_deps_sg(
                     let bytes = fs.load(key)?;
                     let content = std::str::from_utf8(&bytes)?;
                     let res = build_stack_graph(&content, &key.filename);
-
-                    // stackgraphs is not supported for this language
-                    if res.is_none() {
-                        continue;
-                    }
-
-                    store.lock().unwrap().save(&key, res.unwrap().ok())?;
+                    store.lock().unwrap().save(&key, res)?;
                     bar.inc(1);
                 }
                 Ok(())
@@ -525,14 +486,14 @@ fn collect_file_deps_sg(
     log::info!("Loading stack graphs for all {} files...", fs.list().len());
     let LoadResponse { mut ctx, failures } = store.lock().unwrap().load(fs.list())?;
 
-    if failures.len() > 0 {
-        log::warn!(
-            "The following {} files have failed to be built into stack graphs and therefore will \
-             not be considered during dependency resolution:\n{}",
-            failures.len(),
-            failures.iter().sorted().map(|k| &k.filename).join("\n")
-        );
-    }
+    // if failures.len() > 0 {
+    //     log::warn!(
+    //         "The following {} files have failed to be built into stack graphs and therefore will \
+    //          not be considered during dependency resolution:\n{}",
+    //         failures.len(),
+    //         failures.iter().sorted().map(|k| &k.filename).join("\n")
+    //     );
+    // }
 
     log::info!("Resolving all references...");
     Ok((resolve(&mut ctx, &fs), failures))
