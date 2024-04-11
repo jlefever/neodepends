@@ -7,3 +7,6 @@ imports_layout = "HorizontalVertical"
 reorder_imports = true
 group_imports = "StdExternalCrate"
 format_strings = true
+overflow_delimited_expr = true
+reorder_impl_items = true
+merge_derives = false

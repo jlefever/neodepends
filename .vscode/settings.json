@@ -1,0 +1,26 @@
+{
+    "cSpell.words": [
+        "bincode",
+        "canonicalize",
+        "curr",
+        "dels",
+        "filemode",
+        "hasher",
+        "itertools",
+        "longpaths",
+        "namepattern",
+        "ndcache",
+        "Neodepends",
+        "pathspec",
+        "realpath",
+        "repr",
+        "revparse",
+        "revspec",
+        "revspecs",
+        "stackgraphs",
+        "tempfile",
+        "topo",
+        "walkdir",
+        "WORKDIR"
+    ]
+}

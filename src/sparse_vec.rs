@@ -42,7 +42,7 @@ impl<T: Copy + Eq> Entry<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SparseVec<T: Copy + Eq> {
     entries: Vec<Entry<T>>,
 }

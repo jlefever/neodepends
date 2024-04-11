@@ -1,38 +1,33 @@
 use core::panic;
-use std::fmt::Display;
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use clap::ValueEnum;
+use itertools::Itertools;
 use lazy_static::lazy_static;
-use strum::AsRefStr;
 use tree_sitter::Language;
-use tree_sitter::Query;
+use tree_sitter_c::language as c_language;
+use tree_sitter_cpp::language as cpp_language;
+use tree_sitter_go::language as go_language;
+use tree_sitter_java::language as java_language;
+use tree_sitter_javascript::language as js_language;
+use tree_sitter_kotlin::language as kt_language;
+use tree_sitter_python::language as py_language;
+use tree_sitter_ruby::language as rb_language;
 use tree_sitter_stack_graphs::StackGraphLanguage;
+use tree_sitter_typescript::language_typescript as ts_language;
 
-lazy_static! {
-    static ref C: LangConfig = LangConfig::new("c", tree_sitter_c::language(), Some("cpp"));
-    static ref CPP: LangConfig = LangConfig::new("cpp", tree_sitter_cpp::language(), Some("cpp"));
-    static ref GO: LangConfig = LangConfig::new("go", tree_sitter_go::language(), Some("go"));
-    static ref JAVA: LangConfig =
-        LangConfig::new("java", tree_sitter_java::language(), Some("java"));
-    static ref JAVASCRIPT: LangConfig =
-        LangConfig::new("javascript", tree_sitter_javascript::language(), None);
-    static ref KOTLIN: LangConfig =
-        LangConfig::new("kotlin", tree_sitter_kotlin::language(), Some("kotlin"));
-    static ref PYTHON: LangConfig =
-        LangConfig::new("python", tree_sitter_python::language(), Some("python"));
-    static ref RUBY: LangConfig =
-        LangConfig::new("ruby", tree_sitter_ruby::language(), Some("ruby"));
-    static ref TYPESCRIPT: LangConfig =
-        LangConfig::new("typescript", tree_sitter_typescript::language_typescript(), None);
-}
+use crate::spec::Pathspec;
+use crate::tagging::Tagger;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ValueEnum, AsRefStr)]
-#[clap(rename_all = "lower")]
+/// Each programming language supported by Neodepends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(strum::Display, strum::EnumString, strum::VariantNames)]
 #[strum(serialize_all = "lowercase")]
 pub enum Lang {
     C,
@@ -47,83 +42,73 @@ pub enum Lang {
 }
 
 impl Lang {
-    pub fn config(&self) -> &LangConfig {
+    /// Get the language for a filename.
+    pub fn of<S: AsRef<str>>(filename: S) -> Option<Self> {
+        LANG_TABLE.get_lang(filename)
+    }
+
+    /// Get the [Pathspec] associated with this language.
+    #[allow(dead_code)]
+    pub fn pathspec(&self) -> &Pathspec {
+        &self.config().pathspec
+    }
+
+    /// Create a [Pathspec] that matches many languages.
+    pub fn pathspec_many<I: IntoIterator<Item = Lang>>(langs: I) -> Pathspec {
+        Pathspec::new(LANG_TABLE.patterns(langs))
+    }
+
+    /// Get the [Tagger] associated with this language.
+    pub fn tagger(&self) -> &Tagger {
+        &self.config().tagger
+    }
+
+    /// Get the [StackGraphLanguage] associated with this language.
+    pub fn sgl(&self) -> Option<Arc<StackGraphLanguage>> {
+        self.config().sgl.clone()
+    }
+
+    /// Get the name of this language according to Depends.
+    ///
+    /// Intended to be passed to Depends as a command-line argument.
+    pub fn depends_lang(&self) -> Option<&str> {
+        self.config().depends_lang
+    }
+
+    fn config(&self) -> &LangConfig {
         match &self {
             Lang::C => &C,
             Lang::Cpp => &CPP,
             Lang::Go => &GO,
             Lang::Java => &JAVA,
-            Lang::JavaScript => &JAVASCRIPT,
-            Lang::Kotlin => &KOTLIN,
-            Lang::Python => &PYTHON,
-            Lang::Ruby => &RUBY,
-            Lang::TypeScript => &TYPESCRIPT,
+            Lang::JavaScript => &JS,
+            Lang::Kotlin => &KT,
+            Lang::Python => &PY,
+            Lang::Ruby => &RB,
+            Lang::TypeScript => &TS,
         }
-    }
-
-    pub fn from_ext<S: AsRef<str>>(ext: S) -> Option<Self> {
-        match ext.as_ref().to_lowercase().as_ref() {
-            "c" => Some(Lang::C),
-            "c++" => Some(Lang::Cpp),
-            "cc" => Some(Lang::Cpp),
-            "cpp" => Some(Lang::Cpp),
-            "cxx" => Some(Lang::Cpp),
-            "go" => Some(Lang::Go),
-            "h" => Some(Lang::C),
-            "hh" => Some(Lang::Cpp),
-            "hpp" => Some(Lang::Cpp),
-            "hxx" => Some(Lang::Cpp),
-            "java" => Some(Lang::Java),
-            "js" => Some(Lang::JavaScript),
-            "kt" => Some(Lang::Kotlin),
-            "py" => Some(Lang::Python),
-            "rb" => Some(Lang::Ruby),
-            "ts" => Some(Lang::TypeScript),
-            _ => None,
-        }
-    }
-
-    pub fn from_filename<S: AsRef<str>>(filename: S) -> Option<Self> {
-        filename.as_ref().split(".").last().and_then(Self::from_ext)
-    }
-
-    pub fn all() -> &'static [Self] {
-        &[
-            Self::C,
-            Self::Cpp,
-            Self::Go,
-            Self::Java,
-            Self::JavaScript,
-            Self::Kotlin,
-            Self::Python,
-            Self::Ruby,
-            Self::TypeScript,
-        ]
     }
 }
 
-impl Display for Lang {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.as_ref())
-    }
-}
-
-pub struct LangConfig {
-    pub language: Language,
-    pub sgl: Option<StackGraphLanguage>,
-    pub tag_query: Option<Query>,
-    pub dep_query: Option<Query>,
-    pub depends_lang: Option<&'static str>,
+struct LangConfig {
+    pathspec: Pathspec,
+    tagger: Tagger,
+    sgl: Option<Arc<StackGraphLanguage>>,
+    depends_lang: Option<&'static str>,
 }
 
 impl LangConfig {
-    fn new(name: &'static str, language: Language, depends_lang: Option<&'static str>) -> Self {
+    fn new(
+        name: &'static str,
+        language: Language,
+        pathspec: Pathspec,
+        depends_lang: Option<&'static str>,
+    ) -> Self {
         let path = PathBuf::from_str(&format!("../languages/{}", name)).unwrap();
+        let tagger = Tagger::new(Some(language), try_read(path.join("tags.scm")).as_deref());
         let sgl = try_read(path.join("stack-graphs.tsg"))
-            .map(|x| StackGraphLanguage::from_str(language, &x).unwrap());
-        let tag_query = try_read(path.join("tags.scm")).map(|x| Query::new(language, &x).unwrap());
-        let dep_query = try_read(path.join("deps.scm")).map(|x| Query::new(language, &x).unwrap());
-        Self { language, sgl, tag_query, dep_query, depends_lang }
+            .map(|x| Arc::new(StackGraphLanguage::from_str(language, &x).unwrap()));
+        Self { pathspec, tagger, sgl, depends_lang }
     }
 }
 
@@ -139,4 +124,99 @@ fn try_read<P: AsRef<Path>>(path: P) -> Option<String> {
             _ => panic!(),
         },
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct LangLookupTable {
+    special_files: HashMap<String, Lang>,
+    extensions: HashMap<String, Lang>,
+    patterns: HashMap<Lang, Vec<String>>,
+}
+
+impl LangLookupTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_lang<S: AsRef<str>>(&self, filename: S) -> Option<Lang> {
+        self.special_files
+            .get(filename.as_ref())
+            .or_else(|| {
+                filename
+                    .as_ref()
+                    .to_lowercase()
+                    .split(".")
+                    .last()
+                    .and_then(|e| self.extensions.get(e))
+            })
+            .copied()
+    }
+
+    fn pathspec(&self, lang: Lang) -> Pathspec {
+        Pathspec::from_vec(self.patterns.get(&lang).unwrap().clone())
+    }
+
+    fn patterns<I>(&self, langs: I) -> Vec<&String>
+    where
+        I: IntoIterator<Item = Lang>,
+    {
+        let res = langs.into_iter().flat_map(|l| self.patterns.get(&l)).flatten().collect_vec();
+
+        match res.is_empty() {
+            true => self.patterns.values().flatten().unique().collect(),
+            false => res,
+        }
+    }
+
+    fn insert_special_file(&mut self, lang: Lang, special: &str) {
+        self.special_files.insert(special.to_lowercase(), lang);
+        self.patterns.entry(lang).or_default().push(special.to_string());
+    }
+
+    fn insert_extension(&mut self, lang: Lang, ext: &str) {
+        self.extensions.insert(ext.to_lowercase(), lang);
+        self.patterns.entry(lang).or_default().push(format!("*.{}", ext));
+    }
+}
+
+lazy_static! {
+    static ref LANG_TABLE: LangLookupTable = {
+        let mut table = LangLookupTable::new();
+        table.insert_extension(Lang::C, "c");
+        table.insert_extension(Lang::Cpp, "c++");
+        table.insert_extension(Lang::Cpp, "cc");
+        table.insert_extension(Lang::Cpp, "cpp");
+        table.insert_extension(Lang::Cpp, "cxx");
+        table.insert_extension(Lang::Cpp, "h++");
+        table.insert_extension(Lang::Cpp, "hh");
+        table.insert_extension(Lang::Cpp, "hpp");
+        table.insert_extension(Lang::Cpp, "hxx");
+        table.insert_extension(Lang::Go, "go");
+        table.insert_extension(Lang::Java, "java");
+        table.insert_extension(Lang::JavaScript, "js");
+        table.insert_extension(Lang::Kotlin, "kt");
+        table.insert_extension(Lang::Python, "py");
+        table.insert_extension(Lang::Ruby, "rb");
+        table.insert_extension(Lang::TypeScript, "ts");
+        table.insert_special_file(Lang::TypeScript, "tsconfig.json");
+        table
+    };
+    static ref C: LangConfig =
+        LangConfig::new("c", c_language(), LANG_TABLE.pathspec(Lang::C), Some("cpp"));
+    static ref CPP: LangConfig =
+        LangConfig::new("cpp", cpp_language(), LANG_TABLE.pathspec(Lang::Cpp), Some("cpp"));
+    static ref GO: LangConfig =
+        LangConfig::new("go", go_language(), LANG_TABLE.pathspec(Lang::Go), Some("go"));
+    static ref JAVA: LangConfig =
+        LangConfig::new("java", java_language(), LANG_TABLE.pathspec(Lang::Java), Some("java"));
+    static ref JS: LangConfig =
+        LangConfig::new("javascript", js_language(), LANG_TABLE.pathspec(Lang::JavaScript), None);
+    static ref KT: LangConfig =
+        LangConfig::new("kotlin", kt_language(), LANG_TABLE.pathspec(Lang::Kotlin), Some("kotlin"));
+    static ref PY: LangConfig =
+        LangConfig::new("python", py_language(), LANG_TABLE.pathspec(Lang::Python), Some("python"));
+    static ref RB: LangConfig =
+        LangConfig::new("ruby", rb_language(), LANG_TABLE.pathspec(Lang::Ruby), Some("ruby"));
+    static ref TS: LangConfig =
+        LangConfig::new("typescript", ts_language(), LANG_TABLE.pathspec(Lang::TypeScript), None);
 }

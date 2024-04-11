@@ -1,104 +1,20 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::path::Path;
 
 use anyhow::bail;
 use anyhow::Result;
-use serde::Deserialize;
-use serde::Serialize;
-use serde::Serializer;
+use itertools::Itertools;
 use sha1::Digest;
 use sha1::Sha1;
-use strum_macros::AsRefStr;
-use strum_macros::EnumString;
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Deserialize,
-    Serialize,
-    EnumString,
-    AsRefStr,
-)]
-pub enum EntityKind {
-    File,
-    Annotation,
-    Constructor,
-    Class,
-    Enum,
-    Field,
-    Interface,
-    Method,
-    Record,
-}
-
-impl EntityKind {
-    fn as_str(&self) -> &str {
-        self.as_ref()
-    }
-}
-
-impl Display for EntityKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Deserialize,
-    Serialize,
-    EnumString,
-    AsRefStr,
-)]
-pub enum DepKind {
-    Annotation,
-    Call,
-    Cast,
-    Contain,
-    Create,
-    Dependency,
-    Extend,
-    Implement,
-    Import,
-    Link,
-    MixIn,
-    Parameter,
-    Parent,
-    Plugin,
-    Receive,
-    Return,
-    Set,
-    Throw,
-    Use,
-}
-
-impl DepKind {
-    fn as_str(&self) -> &str {
-        self.as_ref()
-    }
-}
-
-impl Display for DepKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A 160 bit SHA-1 hash.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sha1Hash([u8; 20]);
 
 impl Sha1Hash {
@@ -122,11 +38,7 @@ impl Sha1Hash {
     }
 
     pub fn to_string(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.into()
     }
 }
 
@@ -136,162 +48,210 @@ impl AsRef<[u8]> for Sha1Hash {
     }
 }
 
-impl Display for Sha1Hash {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+impl Into<String> for &Sha1Hash {
+    fn into(self) -> String {
+        hex::encode(self.0)
     }
 }
 
-impl Serialize for Sha1Hash {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
+impl serde::Serialize for Sha1Hash {
+    fn serialize<S>(&self, serializer: S) -> std::prelude::v1::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct ContentId(Sha1Hash);
-
-impl ContentId {
-    #[allow(dead_code)]
-    pub fn from(hash: Sha1Hash) -> Self {
-        Self(hash)
-    }
-
-    #[allow(dead_code)]
-    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
-        Ok(Self(Sha1Hash::from_str(str)?))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-
-    pub fn to_oid(&self) -> git2::Oid {
-        git2::Oid::from_bytes(self.as_bytes()).unwrap()
-    }
-}
-
-impl From<git2::Oid> for ContentId {
+impl From<git2::Oid> for Sha1Hash {
     fn from(value: git2::Oid) -> Self {
         unsafe { std::mem::transmute(value) }
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct CommitId(Sha1Hash);
-
-impl CommitId {
-    #[allow(dead_code)]
-    pub fn from(hash: Sha1Hash) -> Self {
-        Self(hash)
-    }
-
-    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
-        Ok(Self(Sha1Hash::from_str(str)?))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-
-    pub fn to_oid(&self) -> git2::Oid {
-        git2::Oid::from_bytes(self.as_bytes()).unwrap()
+impl From<Sha1Hash> for git2::Oid {
+    fn from(value: Sha1Hash) -> Self {
+        unsafe { std::mem::transmute(value) }
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct EntityId(Sha1Hash);
-
-impl EntityId {
-    pub fn new(parent_id: Option<EntityId>, name: &str, kind: EntityKind) -> Self {
-        let mut bytes = Vec::new();
-        bytes.extend(parent_id.unwrap_or_default().as_bytes());
-        bytes.extend(name.as_bytes());
-        bytes.extend(kind.as_str().as_bytes());
-        Self::from(Sha1Hash::hash(&bytes))
-    }
-
-    pub fn from(hash: Sha1Hash) -> Self {
-        Self(hash)
-    }
-
-    #[allow(dead_code)]
-    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
-        Ok(Self(Sha1Hash::from_str(str)?))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+impl Debug for Sha1Hash {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Sha1Hash").field(&self.to_string()).finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Entity {
-    pub id: EntityId,
-    pub parent_id: Option<EntityId>,
-    pub name: String,
-    pub kind: EntityKind,
-}
+/// The ID of a commit as identified by git.
+///
+/// Internally, git calculates this as a SHA-1 hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct CommitId(pub Sha1Hash);
 
-impl Entity {
-    pub fn new(parent_id: Option<EntityId>, name: String, kind: EntityKind) -> Self {
-        let id = EntityId::new(parent_id, &name, kind);
-        Self { id, parent_id, name, kind }
+impl Display for CommitId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_string())
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct TagId(Sha1Hash);
+impl From<git2::Oid> for CommitId {
+    fn from(value: git2::Oid) -> Self {
+        Self(value.into())
+    }
+}
 
-impl TagId {
-    pub fn new(parent_id: Option<TagId>, entity_id: EntityId, location: Span) -> Self {
-        let mut bytes = Vec::new();
-        bytes.extend(parent_id.unwrap_or_default().as_bytes());
-        bytes.extend(entity_id.as_bytes());
+impl From<CommitId> for git2::Oid {
+    fn from(value: CommitId) -> Self {
+        value.0.into()
+    }
+}
 
-        fn to_bytes(num: usize) -> [u8; 4] {
-            unsafe { std::mem::transmute(u32::try_from(num).unwrap().to_be()) }
+/// Might refer to an actual commit or may refer to the project directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(strum::EnumIs, strum::EnumTryAs)]
+pub enum PseudoCommitId {
+    CommitId(CommitId),
+    WorkDir,
+}
+
+impl serde::Serialize for PseudoCommitId {
+    fn serialize<S>(&self, serializer: S) -> std::prelude::v1::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            PseudoCommitId::CommitId(commit_id) => commit_id.0.serialize(serializer),
+            PseudoCommitId::WorkDir => serializer.serialize_str("WORKDIR"),
+        }
+    }
+}
+
+/// The SHA-1 hash of the content of a file.
+///
+/// This is exactly how git calculates the ID of a blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct ContentId(pub Sha1Hash);
+
+impl ContentId {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> ContentId {
+        git2::Oid::hash_file(git2::ObjectType::Blob, path).unwrap().into()
+    }
+
+    pub fn from_content(content: &str) -> ContentId {
+        git2::Oid::hash_object(git2::ObjectType::Blob, content.as_bytes()).unwrap().into()
+    }
+}
+
+impl From<git2::Oid> for ContentId {
+    fn from(value: git2::Oid) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<ContentId> for git2::Oid {
+    fn from(value: ContentId) -> Self {
+        value.0.into()
+    }
+}
+
+/// A unique identifier for a particular version of a file.
+///
+/// Ordinarily, [ContentId] would be good enough to uniquely identify a file,
+/// however, there are some cases where a filename is necessary. For instance,
+/// entity extraction (the root entity depends on the filename), and dependency
+/// resolution. The filename is simply the path of the file relative to the
+/// project root.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileKey {
+    pub filename: String,
+    pub content_id: ContentId,
+}
+
+impl FileKey {
+    pub fn new(filename: String, content_id: ContentId) -> Self {
+        Self { filename, content_id }
+    }
+
+    pub fn from_content(filename: String, content: &str) -> Self {
+        Self { filename, content_id: ContentId::from_content(content) }
+    }
+}
+
+/// A collection of [FileKey]s with unique [FileKey::filename]s.
+///
+/// Intended to represent the project at a particular version.
+#[derive(Debug, Clone)]
+pub struct FileSet {
+    file_keys: Vec<FileKey>,
+    filenames: HashMap<String, usize>,
+}
+
+impl FileSet {
+    /// Create a [FileSet] from an iterator of [FileKey]s.
+    ///
+    /// Panics if there are any duplicate [FileKey::filename]s.
+    pub fn new<I: IntoIterator<Item = FileKey>>(file_keys: I) -> Self {
+        let file_keys = file_keys.into_iter().sorted().collect_vec();
+        let mut filenames = HashMap::with_capacity(file_keys.len());
+
+        for (i, file_key) in file_keys.iter().enumerate() {
+            if let Some(_) = filenames.insert(file_key.filename.clone(), i) {
+                panic!("filenames must be unique");
+            }
         }
 
-        bytes.extend(to_bytes(location.start_byte()));
-        bytes.extend(to_bytes(location.start_row()));
-        bytes.extend(to_bytes(location.start_column()));
-        bytes.extend(to_bytes(location.end_byte()));
-        bytes.extend(to_bytes(location.end_row()));
-        bytes.extend(to_bytes(location.end_column()));
-        Self::from(Sha1Hash::hash(&bytes))
+        Self { file_keys, filenames }
     }
 
-    pub fn from(hash: Sha1Hash) -> Self {
-        Self(hash)
+    pub fn iter(&self) -> impl Iterator<Item = &FileKey> {
+        self.file_keys.iter()
     }
 
-    #[allow(dead_code)]
-    pub fn from_str<S: AsRef<str>>(str: S) -> Result<Self> {
-        Ok(Self(Sha1Hash::from_str(str)?))
+    pub fn get<S: AsRef<str>>(&self, filename: S) -> Option<&FileKey> {
+        self.filenames.get(filename.as_ref()).map(|&i| &self.file_keys[i])
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+    pub fn get_content_id<S: AsRef<str>>(&self, filename: S) -> Option<ContentId> {
+        self.get(filename).map(|f| f.content_id)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Tag {
-    pub id: TagId,
-    pub parent_id: Option<TagId>,
-    pub entity: Entity,
-    pub location: Span,
+/// A collection of [FileSet]s.
+///
+/// Each `FileSet` is at a different version of the project. A version is
+/// represented using [PseudoCommitId].
+#[derive(Debug, Clone)]
+pub struct MultiFileSet {
+    files: BTreeSet<FileKey>,
+    file_sets: BTreeMap<PseudoCommitId, FileSet>,
 }
 
-impl Tag {
-    pub fn new(parent_id: Option<TagId>, entity: Entity, location: Span) -> Self {
-        let id = TagId::new(parent_id, entity.id, location);
-        Self { id, parent_id, entity, location }
+impl MultiFileSet {
+    /// Create a [MultiFileSet] from a mapping from `PseudoCommitId` to
+    /// `FileSet`.
+    ///
+    /// A [BTreeMap] is used because we want to preserve the order of the
+    /// versions.
+    pub fn new(file_sets: BTreeMap<PseudoCommitId, FileSet>) -> Self {
+        let files = file_sets.values().flat_map(|x| x.iter()).cloned().collect();
+        Self { files, file_sets }
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = &FileKey> {
+        self.files.iter()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&PseudoCommitId, &FileSet)> {
+        self.file_sets.iter()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// A position (i.e. index) within a file.
+///
+/// Specified both in terms of (row, column) and byte offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
 pub struct Position {
     pub byte: usize,
     pub row: usize,
@@ -304,7 +264,9 @@ impl Position {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// An inclusive range of text within a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub struct Span {
     pub start: Position,
     pub end: Position,
@@ -315,52 +277,12 @@ impl Span {
         Self { start, end }
     }
 
-    pub fn from_ts(range: &tree_sitter::Range) -> Self {
-        let &tree_sitter::Range { start_byte, end_byte, start_point, end_point } = range;
-        let start = Position::new(start_byte, start_point.row, start_point.column);
-        let end = Position::new(end_byte, end_point.row, end_point.column);
-        Self::new(start, end)
+    pub fn from_ts(value: tree_sitter::Range) -> Self {
+        value.into()
     }
 
-    pub fn from_lsp(span: &lsp_positions::Span) -> Self {
-        fn to_utf8_byte_index(position: &lsp_positions::Position) -> usize {
-            position.containing_line.start + position.column.utf8_offset
-        }
-        let start = Position::new(
-            to_utf8_byte_index(&span.start),
-            span.start.as_point().row,
-            span.start.as_point().column,
-        );
-        let end = Position::new(
-            to_utf8_byte_index(&span.start),
-            span.start.as_point().row,
-            span.start.as_point().column,
-        );
-        Self::new(start, end)
-    }
-
-    pub fn start_byte(self) -> usize {
-        self.start.byte
-    }
-
-    pub fn start_row(self) -> usize {
-        self.start.row
-    }
-
-    pub fn start_column(self) -> usize {
-        self.start.column
-    }
-
-    pub fn end_byte(self) -> usize {
-        self.end.byte
-    }
-
-    pub fn end_row(self) -> usize {
-        self.end.row
-    }
-
-    pub fn end_column(self) -> usize {
-        self.end.column
+    pub fn from_lsp(value: &lsp_positions::Span) -> Self {
+        value.into()
     }
 }
 
@@ -380,59 +302,219 @@ impl Ord for Span {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+impl From<tree_sitter::Range> for Span {
+    fn from(value: tree_sitter::Range) -> Self {
+        let tree_sitter::Range { start_byte, end_byte, start_point, end_point } = value;
+        let start = Position::new(start_byte, start_point.row, start_point.column);
+        let end = Position::new(end_byte, end_point.row, end_point.column);
+        Self::new(start, end)
+    }
+}
+
+impl From<&lsp_positions::Span> for Span {
+    fn from(value: &lsp_positions::Span) -> Self {
+        fn to_utf8_byte_index(position: &lsp_positions::Position) -> usize {
+            position.containing_line.start + position.column.utf8_offset
+        }
+        let start = Position::new(
+            to_utf8_byte_index(&value.start),
+            value.start.as_point().row,
+            value.start.as_point().column,
+        );
+        let end = Position::new(
+            to_utf8_byte_index(&value.start),
+            value.start.as_point().row,
+            value.start.as_point().column,
+        );
+        Self::new(start, end)
+    }
+}
+
+/// Like [Position] but it is possible that only the byte or row is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PartialPosition {
     Byte(usize),
     Row(usize),
     Whole(Position),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// Like [Span] but it is possible that only the bytes or rows are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PartialSpan {
     Byte(usize, usize),
     Row(usize, usize),
     Whole(Span),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FileKey {
-    pub filename: String,
-    pub content_id: ContentId,
+/// A number representing the type of an [Entity].
+///
+/// Most languages only use a subset of these.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(strum::AsRefStr, strum::EnumString)]
+pub enum EntityKind {
+    File,
+    Annotation,
+    Constructor,
+    Class,
+    Enum,
+    Field,
+    Interface,
+    Method,
+    Record,
 }
 
-impl FileKey {
-    pub fn new(filename: String, content_id: ContentId) -> Self {
-        Self { filename, content_id }
-    }
+/// A "simpler" [EntityId] that is only calculated from `parent_id`, `name`, and
+/// `kind`.
+///
+/// This is how we correlate entities from different versions. Unfortunately,
+/// entities in the same version may sometimes re-use the same
+/// `SimpleEntityId``. For instance, overloaded Java methods will all be given
+/// the same `SimpleEntityId`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct SimpleEntityId(pub Sha1Hash);
 
-    pub fn to_sha1_hash(&self) -> Sha1Hash {
+impl SimpleEntityId {
+    pub fn new(parent_id: Option<SimpleEntityId>, name: &str, kind: EntityKind) -> Self {
         let mut bytes = Vec::new();
-        bytes.extend(self.filename.as_bytes());
-        bytes.extend(self.content_id.as_bytes());
-        Sha1Hash::hash(&bytes)
+        bytes.extend(parent_id.unwrap_or_default().0.as_ref());
+        bytes.extend(name.as_bytes());
+        bytes.extend(kind.as_ref().as_bytes());
+        Self(Sha1Hash::hash(&bytes))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// A unique identifier for an [Entity].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct EntityId(pub Sha1Hash);
+
+impl EntityId {
+    pub fn new(
+        parent_id: Option<EntityId>,
+        name: &str,
+        kind: EntityKind,
+        location: Span,
+        content_id: ContentId,
+        simple_id: SimpleEntityId,
+    ) -> Self {
+        let mut bytes = Vec::new();
+        bytes.extend(parent_id.unwrap_or_default().0.as_ref());
+        bytes.extend(name.as_bytes());
+        bytes.extend(kind.as_ref().as_bytes());
+
+        fn to_bytes(num: usize) -> [u8; 4] {
+            unsafe { std::mem::transmute(u32::try_from(num).unwrap().to_be()) }
+        }
+
+        bytes.extend(to_bytes(location.start.byte));
+        bytes.extend(to_bytes(location.start.row));
+        bytes.extend(to_bytes(location.start.column));
+        bytes.extend(to_bytes(location.end.byte));
+        bytes.extend(to_bytes(location.end.row));
+        bytes.extend(to_bytes(location.end.column));
+        bytes.extend(content_id.0.as_ref());
+        bytes.extend(simple_id.0.as_ref());
+        Self(Sha1Hash::hash(&bytes))
+    }
+}
+
+/// An interesting block of source code with a name.
+///
+/// Entities are discovered inside a file using
+/// [tree-sitter](https://tree-sitter.github.io/tree-sitter/). An entity is at the root
+/// (`parent_id.is_none() = true`) if and only if it is an [EntityKind::File].
+/// Entities are also called "tags".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct Entity {
+    pub id: EntityId,
+    pub parent_id: Option<EntityId>,
+    pub name: String,
+    pub kind: EntityKind,
+    pub location: Span,
+    pub content_id: ContentId,
+    pub simple_id: SimpleEntityId,
+}
+
+impl Entity {
+    pub fn new(
+        parent_id: Option<EntityId>,
+        name: String,
+        kind: EntityKind,
+        location: Span,
+        content_id: ContentId,
+        simple_id: SimpleEntityId,
+    ) -> Self {
+        let id = EntityId::new(parent_id, &name, kind, location, content_id, simple_id);
+        Self { id, parent_id, name, kind, location, content_id, simple_id }
+    }
+}
+
+/// A number representing the type of an [Dep].
+///
+/// Most languages use only a subset of these.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(strum::AsRefStr, strum::EnumString)]
+pub enum DepKind {
+    Annotation,
+    Call,
+    Cast,
+    Contain,
+    Create,
+    Dependency,
+    Extend,
+    Implement,
+    Import,
+    Link,
+    MixIn,
+    Parameter,
+    Parent,
+    Plugin,
+    Receive,
+    Return,
+    Set,
+    Throw,
+    Use,
+}
+
+/// A syntactic dependency between two files.
+///
+/// [Self::position] refers to the location of the dependency within the source
+/// file. For instance, the exact byte where a function is invoked.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
 pub struct Dep<E> {
     pub src: E,
     pub tgt: E,
     pub kind: DepKind,
     pub position: PartialPosition,
+    pub commit_id: PseudoCommitId,
 }
 
 impl<E> Dep<E> {
-    pub fn new(src: E, tgt: E, kind: DepKind, position: PartialPosition) -> Self {
-        Self { src, tgt, kind, position }
+    pub fn new(
+        src: E,
+        tgt: E,
+        kind: DepKind,
+        position: PartialPosition,
+        commit_id: PseudoCommitId,
+    ) -> Self {
+        Self { src, tgt, kind, position, commit_id }
     }
 }
 
-impl<E: Eq> Dep<E> {
-    pub fn is_loop(&self) -> bool {
-        self.src == self.tgt
-    }
-}
-
+/// Intended to be used with [Dep] to represent a file-level dependency.
+///
+/// See [FileDep].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileEndpoint {
     pub file_key: FileKey,
@@ -445,45 +527,91 @@ impl FileEndpoint {
     }
 }
 
+/// Intended to be used with [Dep] to represent a file-level dependency.
+///
+/// Similar to [FileEndpoint], but without having to know
+/// [FileKey::content_id].
+///
+/// See [FileDep].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FilenameEndpoint {
+    pub filename: String,
+    pub position: PartialPosition,
+}
+
+impl FilenameEndpoint {
+    pub fn new(filename: String, position: PartialPosition) -> Self {
+        Self { filename, position }
+    }
+
+    pub fn into_file_endpoint(self, file_set: &FileSet) -> Option<FileEndpoint> {
+        let content_id = file_set.get_content_id(&self.filename);
+        content_id.map(|c| FileEndpoint::new(FileKey::new(self.filename, c), self.position))
+    }
+}
+
+/// A dependency between files.
 pub type FileDep = Dep<FileEndpoint>;
 
-pub type TagDep = Dep<TagId>;
+/// A dependency between filenames.
+pub type FilenameDep = Dep<FilenameEndpoint>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, AsRefStr)]
+/// A dependency between entities.
+pub type EntityDep = Dep<EntityId>;
+
+impl FilenameDep {
+    pub fn into_file_dep(self, file_set: &FileSet) -> Option<FileDep> {
+        let src = self.src.into_file_endpoint(file_set)?;
+        let tgt = self.tgt.into_file_endpoint(file_set)?;
+        Some(Dep::new(src, tgt, self.kind, self.position, self.commit_id))
+    }
+}
+
+/// A number representing the type of a [Change].
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+#[derive(strum::AsRefStr, strum::EnumString)]
 pub enum ChangeKind {
     Added,
     Deleted,
     Modified,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Change<T> {
-    pub target_id: T,
+/// A record of an [Entity] being touched by a commit.
+///
+/// The number of lines added and deleted are stored in [Self::adds] and
+/// [Self::dels] respectively. Be careful not to count these more than once when
+/// mapping [SimpleEntityId] back to [EntityId].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct Change {
+    pub simple_id: SimpleEntityId,
     pub commit_id: CommitId,
     pub kind: ChangeKind,
     pub adds: usize,
     pub dels: usize,
 }
 
-impl<T> Change<T> {
+impl Change {
     pub fn new(
-        target_id: T,
+        simple_id: SimpleEntityId,
         commit_id: CommitId,
         kind: ChangeKind,
         adds: usize,
         dels: usize,
     ) -> Self {
-        Self { target_id, commit_id, kind, adds, dels }
-    }
-
-    pub fn with_id<U>(&self, target_id: U) -> Change<U> {
-        Change::<U>::new(target_id, self.commit_id, self.kind, self.adds, self.dels)
+        Self { simple_id, commit_id, kind, adds, dels }
     }
 }
 
+/// A record of a block of text that has been changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hunk {
+    /// A block of text from the old version that has been deleted
     pub old: PartialSpan,
+
+    /// A block of text from the new version that has been added
     pub new: PartialSpan,
 }
 
@@ -499,6 +627,7 @@ impl Hunk {
     }
 }
 
+/// A collection of [Hunk]s for a particular file in a particular commit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Diff {
     pub commit_id: CommitId,
@@ -508,16 +637,8 @@ pub struct Diff {
 }
 
 impl Diff {
-    pub fn deleted(commit_id: CommitId, old: FileKey) -> Self {
-        Self { commit_id, old: Some(old), new: None, hunks: Vec::new() }
-    }
-
-    pub fn added(commit_id: CommitId, new: FileKey) -> Self {
-        Self { commit_id, old: None, new: Some(new), hunks: Vec::new() }
-    }
-
-    pub fn modified(commit_id: CommitId, old: FileKey, new: FileKey, hunks: Vec<Hunk>) -> Self {
-        Self { commit_id, old: Some(old), new: Some(new), hunks }
+    pub fn new(id: CommitId, old: Option<FileKey>, new: Option<FileKey>, hunks: Vec<Hunk>) -> Self {
+        Self { commit_id: id, old, new, hunks }
     }
 
     pub fn change_kind(&self) -> ChangeKind {
@@ -527,5 +648,17 @@ impl Diff {
             (Some(_), None) => ChangeKind::Deleted,
             (Some(_), Some(_)) => ChangeKind::Modified,
         }
+    }
+
+    pub fn iter_file_keys(&self) -> impl Iterator<Item = &FileKey> {
+        self.old.as_ref().into_iter().chain(self.new.as_ref().into_iter())
+    }
+
+    pub fn iter_old_spans(&self) -> impl Iterator<Item = PartialSpan> + '_ {
+        self.hunks.iter().map(|h| h.old)
+    }
+
+    pub fn iter_new_spans(&self) -> impl Iterator<Item = PartialSpan> + '_ {
+        self.hunks.iter().map(|h| h.new)
     }
 }
