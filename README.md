@@ -14,12 +14,32 @@ cargo build --release
 cargo run -- --help
 ```
 
-or if on macOS or Linux
-
+Or download a recent [release](https://github.com/jlefever/neodepends/releases) and run
 ```bash
-ln -s "$(realpath target/release/neodepends)" /usr/local/bin/neodepends  # only needed to be run once
 neodepends --help
 ```
+
+## Example
+
+Here is an example of how to generate a design structure matrix from a software repository.
+
+```bash
+git clone https://github.com/apache/deltaspike
+cd deltaspike
+neodepends matrix --depends HEAD > matrix.json
+```
+
+`HEAD` can be replaced with any commit (e.g. branch, tag, short or long hash) or with `WORKDIR` if you want to scan directly from disk and not from the git repository. (Neodepends still works even if the project is not a git repository.)
+
+To get cochange information, simply pass more than one commit. Neodepends is designed to work well with [git rev-list](https://git-scm.com/docs/git-rev-list). (On Windows, you may need to use Powershell.)
+
+```bash
+neodepends matrix --depends $(git rev-list deltaspike-1.9.6 -n 300) > matrix.json
+```
+
+This will extract entities and dependencies from `deltaspike-1.9.6` and use the most recent 300 commits that are reachable from `deltaspike-1.9.6` to calculate cochange.
+
+If you prefer the older format, pass `--format=dsm-v1`. If you prefer the newer format but still want only file-level info, pass the `--file-level` flag. To scan a different directory than the working directory, use `--input`. See `neodepends matrix --help` for more.
 
 ## Help
 
