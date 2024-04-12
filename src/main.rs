@@ -6,9 +6,9 @@ use core::Entity;
 use core::EntityDep;
 use core::PseudoCommitId;
 use std::collections::HashMap;
-use std::env::current_dir;
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -136,6 +136,20 @@ struct IoOpts {
     force: bool,
 }
 
+impl IoOpts {
+    fn input(&self) -> Result<PathBuf> {
+        Ok(self.input.clone().unwrap_or(std::env::current_dir()?))
+    }
+
+    fn create_writer(&self) -> Result<Box<dyn Write>> {
+        Ok(match (&self.output, self.force) {
+            (Some(path), false) => Box::new(File::create_new(path)?),
+            (Some(path), true) => Box::new(File::create(path)?),
+            _ => Box::new(std::io::stdout()),
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 struct LoggingOpts {
     #[command(flatten)]
@@ -201,7 +215,7 @@ enum SubCommandOpts {
 #[derive(Debug, Args)]
 struct ExportMatrixOpts {
     /// Format of DSM output
-    /// 
+    ///
     /// When --format=dsm-v1, --file-level is implied.
     #[arg(long, default_value_t, value_parser = strum_parser!(MatrixFormat))]
     format: MatrixFormat,
@@ -364,64 +378,84 @@ fn main() -> Result<()> {
     let matches = Opts::command().get_matches();
     let opts = Opts::from_arg_matches(&matches)?;
     env_logger::Builder::new().filter_level(opts.logging_opts.verbose.log_level_filter()).init();
-    let fs = FileSystem::open(opts.io_opts.input.clone().unwrap_or(current_dir()?));
+    let fs = FileSystem::open(opts.io_opts.input()?);
     let pathspec = opts.pathspec_opts().pathspec()?;
     let file_level = opts.file_level();
     let depends_config = opts.depends_opts.to_depends_config();
 
+    let mut writer = opts.io_opts.create_writer()?;
     let mut extractor = Extractor::new(fs.clone(), file_level);
     let start = Instant::now();
 
     match opts.command {
-        SubCommandOpts::Entities(opts) => {
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            let filespec = Filespec::new(commits, pathspec);
-
-            for entity in extractor.extract_entities(&filespec) {
-                println!("{}", serde_json::to_string(&entity)?);
-            }
-        }
-        SubCommandOpts::Changes(opts) => {
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            let filespec = Filespec::new(commits, pathspec);
-
-            for entity in extractor.extract_changes(&filespec) {
-                println!("{}", serde_json::to_string(&entity)?);
-            }
-        }
-        SubCommandOpts::Deps(opts) => {
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            let filespec = Filespec::new(commits, pathspec);
-
-            // Setup resolver
-            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
-            extractor.set_resolver(resolver);
-
-            for entity in extractor.extract_deps(&filespec) {
-                println!("{}", serde_json::to_string(&entity)?);
-            }
-        }
         SubCommandOpts::Matrix(opts) => {
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
+            ensure_nonempty(&commits)?;
             let dep_commit = commits[0].clone();
             let dep_filespec = Filespec::new(vec![dep_commit], pathspec.clone());
             let change_filespec = Filespec::new(commits, pathspec);
 
-            // Setup resolver
             let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
             extractor.set_resolver(resolver);
 
-            // Extract and print
             let entities = extractor.extract_entities(&dep_filespec);
             let deps = extractor.extract_deps(&dep_filespec);
             let changes = extractor.extract_changes(&change_filespec);
-            println!("{}", opts.format.to_matrix_str(&entities, &deps, &changes));
+            writer.write_all(opts.format.to_matrix_str(&entities, &deps, &changes).as_bytes())?;
         }
-        _ => (),
+        SubCommandOpts::Dump(opts) => {
+            let dep_commits = try_parse_revspecs(&fs, &opts.structure)?;
+            let change_commits = try_parse_revspecs(&fs, &opts.history)?;
+            let dep_filespec = Filespec::new(dep_commits, pathspec.clone());
+            let change_filespec = Filespec::new(change_commits, pathspec);
+
+            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
+            extractor.set_resolver(resolver);
+
+            write_jsonl(&mut writer, &extractor.extract_entities(&dep_filespec));
+            write_jsonl(&mut writer, &extractor.extract_deps(&dep_filespec));
+            write_jsonl(&mut writer, &extractor.extract_changes(&change_filespec));
+        }
+        SubCommandOpts::Entities(opts) => {
+            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
+            ensure_nonempty(&commits)?;
+            let filespec = Filespec::new(commits, pathspec);
+            write_jsonl(&mut writer, &extractor.extract_entities(&filespec));
+        }
+        SubCommandOpts::Deps(opts) => {
+            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
+            ensure_nonempty(&commits)?;
+            let filespec = Filespec::new(commits, pathspec);
+
+            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
+            extractor.set_resolver(resolver);
+
+            write_jsonl(&mut writer, &extractor.extract_deps(&filespec));
+        }
+        SubCommandOpts::Changes(opts) => {
+            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
+            ensure_nonempty(&commits)?;
+            let filespec = Filespec::new(commits, pathspec);
+            write_jsonl(&mut writer, &extractor.extract_changes(&filespec));
+        }
     }
 
     log::info!("Finished in {}ms", start.elapsed().as_millis());
     Ok(())
+}
+
+fn write_jsonl<W: Write, T: serde::Serialize>(mut writer: W, elements: &[T]) {
+    for element in elements {
+        serde_json::to_writer(&mut writer, element).unwrap()
+    }
+}
+
+fn ensure_nonempty(ids: &[PseudoCommitId]) -> Result<()> {
+    if ids.is_empty() {
+        bail!("must provide at least one commit (e.g. HEAD or WORKDIR)");
+    } else {
+        Ok(())
+    }
 }
 
 fn try_parse_revspecs(fs: &FileSystem, revspecs: &[String]) -> Result<Vec<PseudoCommitId>> {
@@ -436,10 +470,6 @@ fn try_parse_revspecs(fs: &FileSystem, revspecs: &[String]) -> Result<Vec<Pseudo
     }
 
     let ids = ids.into_iter().unique().collect_vec();
-
-    if ids.is_empty() {
-        bail!("must provide at least one commit (e.g. HEAD or WORKDIR)");
-    }
 
     Ok(ids)
 }
