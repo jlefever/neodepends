@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::Path;
 
@@ -81,7 +81,7 @@ unsafe impl Sync for Pathspec {}
 /// least one of [Self::commits] is included.
 #[derive(Debug, Clone)]
 pub struct Filespec {
-    pub commits: BTreeSet<PseudoCommitId>,
+    pub commits: HashSet<PseudoCommitId>,
     pub pathspec: Pathspec,
 }
 

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -30,7 +29,7 @@ use crate::sparse_vec::SparseVec;
 /// The ordered collection of entities contained within a particular [FileKey].
 #[derive(Debug, Clone)]
 pub struct EntitySet {
-    entities: BTreeMap<EntityId, Entity>,
+    entities: HashMap<EntityId, Entity>,
     table: LocationTable,
 }
 
@@ -44,7 +43,9 @@ impl EntitySet {
     }
 
     pub fn into_entities_vec(self) -> Vec<Entity> {
-        self.entities.into_values().collect()
+        let indices: HashMap<_, _> =
+            self.table.ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        self.entities.into_values().sorted_by_key(|e| indices[&e.id]).collect()
     }
 
     pub fn find_id(&self, position: PartialPosition) -> Option<EntityId> {
@@ -77,16 +78,20 @@ impl FileDep {
 
 #[derive(Debug, Clone)]
 struct LocationTable {
+    ids: Vec<EntityId>,
     bytes: SparseVec<EntityId>,
     rows: SparseVec<EntityId>,
 }
 
 impl LocationTable {
     fn from_topo_slice(entities: &[Entity]) -> Self {
+        let mut ids = Vec::with_capacity(entities.len());
         let mut bytes = SparseVec::with_capacity(entities.len());
         let mut rows = SparseVec::with_capacity(entities.len());
 
         for Entity { id, parent_id, location, .. } in entities {
+            ids.push(*id);
+
             // TODO: Ensure the file location calculation is correct so this isn't necessary
             if parent_id.is_none() {
                 bytes.insert_many(usize::MIN, usize::MAX, *id);
@@ -97,7 +102,7 @@ impl LocationTable {
             }
         }
 
-        Self { bytes, rows }
+        Self { ids, bytes, rows }
     }
 
     fn find_id(&self, position: PartialPosition) -> Option<EntityId> {
@@ -131,7 +136,11 @@ impl Tagger {
         }
     }
 
-    pub fn tag(&self, filename: &str, content: &str) -> EntitySet {
+    pub fn tag(&self, filename: &str, content: &str, file_level: bool) -> EntitySet {
+        if file_level {
+            return to_singleton_entity_set(filename, content);
+        }
+
         match self {
             Tagger::EntityLevel(tagger) => match tagger.tag(filename, content) {
                 Ok(entity_set) => entity_set,

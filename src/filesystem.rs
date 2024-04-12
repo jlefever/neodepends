@@ -1,5 +1,4 @@
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -73,7 +72,7 @@ impl FileSystem {
     /// Walk the commits and files reachable from the given [Filespec],
     /// returning the results as a [MultiFileSet].
     pub fn list(&self, spec: &Filespec) -> MultiFileSet {
-        let mut map = BTreeMap::new();
+        let mut map = HashMap::new();
 
         if spec.commits.contains(&PseudoCommitId::WorkDir) {
             map.insert(PseudoCommitId::WorkDir, self.disk.list(&spec.pathspec).unwrap());

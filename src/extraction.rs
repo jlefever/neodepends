@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::sync::RwLock;
 
 use counter::Counter;
+use itertools::Itertools;
 use rayon::prelude::*;
 
 use crate::core::Change;
@@ -11,27 +12,36 @@ use crate::core::Entity;
 use crate::core::EntityDep;
 use crate::core::FileKey;
 use crate::core::SimpleEntityId;
-use crate::languages::Lang;
-use crate::spec::Filespec;
 use crate::filesystem::FileReader;
 use crate::filesystem::FileSystem;
+use crate::languages::Lang;
 use crate::resolution::ResolverManager;
+use crate::spec::Filespec;
 use crate::tagging::EntitySet;
 
 pub struct Extractor {
     fs: FileSystem,
+    file_level: bool,
     resolver: ResolverManager,
     entity_sets: RwLock<HashMap<FileKey, EntitySet>>,
 }
 
 impl Extractor {
-    pub fn new(fs: FileSystem, resolver: ResolverManager) -> Self {
-        Self { fs, resolver, entity_sets: Default::default() }
+    pub fn new(fs: FileSystem, file_level: bool) -> Self {
+        Self { fs, file_level, resolver: ResolverManager::empty(), entity_sets: Default::default() }
+    }
+
+    pub fn set_resolver(&mut self, resolver: ResolverManager) {
+        self.resolver = resolver;
     }
 
     pub fn extract_entities(&self, spec: &Filespec) -> Vec<Entity> {
-        let files = self.fs.list(spec).files().cloned().collect::<HashSet<_>>();
-        self.iter_entity_sets(files).flat_map(|(_, e)| e.into_entities_vec()).collect()
+        let files = self.fs.list(spec).files().sorted().cloned().collect::<HashSet<_>>();
+        self.collect_entity_sets(files)
+            .into_iter()
+            .sorted_by_key(|(f, _)| f.clone())
+            .flat_map(|(_, e)| e.into_entities_vec())
+            .collect()
     }
 
     pub fn extract_changes(&self, spec: &Filespec) -> Vec<Change> {
@@ -48,9 +58,13 @@ impl Extractor {
 
     pub fn extract_deps(&self, spec: &Filespec) -> Vec<EntityDep> {
         let files = self.fs.list(spec);
-        let deps = self.resolver.resolve(&self.fs, &files);
         let entity_sets = self.collect_entity_sets(files.files().cloned().collect());
-        deps.into_par_iter().map(move |d| d.to_entity_dep(&entity_sets).unwrap()).collect()
+        self.resolver
+            .resolve(&self.fs, &files)
+            .into_par_iter()
+            .map(move |d| d.to_entity_dep(&entity_sets).unwrap())
+            .filter(|d| !d.is_loop())
+            .collect()
     }
 
     fn collect_entity_sets(&self, files: HashSet<FileKey>) -> HashMap<FileKey, EntitySet> {
@@ -68,7 +82,7 @@ impl Extractor {
 
             let content = self.fs.read(&f).unwrap();
             let lang = Lang::of(&f.filename).unwrap();
-            let entity_set = lang.tagger().tag(&f.filename, &content);
+            let entity_set = lang.tagger().tag(&f.filename, &content, self.file_level);
             self.entity_sets.write().unwrap().insert(f.clone(), entity_set.clone());
             (f, entity_set)
         })

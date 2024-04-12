@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -223,17 +222,14 @@ impl FileSet {
 /// represented using [PseudoCommitId].
 #[derive(Debug, Clone)]
 pub struct MultiFileSet {
-    files: BTreeSet<FileKey>,
-    file_sets: BTreeMap<PseudoCommitId, FileSet>,
+    files: HashSet<FileKey>,
+    file_sets: HashMap<PseudoCommitId, FileSet>,
 }
 
 impl MultiFileSet {
     /// Create a [MultiFileSet] from a mapping from `PseudoCommitId` to
     /// `FileSet`.
-    ///
-    /// A [BTreeMap] is used because we want to preserve the order of the
-    /// versions.
-    pub fn new(file_sets: BTreeMap<PseudoCommitId, FileSet>) -> Self {
+    pub fn new(file_sets: HashMap<PseudoCommitId, FileSet>) -> Self {
         let files = file_sets.values().flat_map(|x| x.iter()).cloned().collect();
         Self { files, file_sets }
     }
@@ -356,7 +352,7 @@ pub enum PartialSpan {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(serde::Deserialize, serde::Serialize)]
-#[derive(strum::AsRefStr, strum::EnumString)]
+#[derive(strum::AsRefStr, strum::EnumIs, strum::EnumString)]
 pub enum EntityKind {
     File,
     Annotation,
@@ -463,7 +459,7 @@ impl Entity {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(serde::Deserialize, serde::Serialize)]
-#[derive(strum::AsRefStr, strum::EnumString)]
+#[derive(strum::AsRefStr, strum::Display, strum::EnumIs, strum::EnumString)]
 pub enum DepKind {
     Annotation,
     Call,
@@ -509,6 +505,12 @@ impl<E> Dep<E> {
         commit_id: PseudoCommitId,
     ) -> Self {
         Self { src, tgt, kind, position, commit_id }
+    }
+}
+
+impl<E: Eq> Dep<E> {
+    pub fn is_loop(&self) -> bool {
+        self.src == self.tgt
     }
 }
 
@@ -571,7 +573,7 @@ impl FilenameDep {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(serde::Serialize)]
-#[derive(strum::AsRefStr, strum::EnumString)]
+#[derive(strum::AsRefStr, strum::EnumIs, strum::EnumString)]
 pub enum ChangeKind {
     Added,
     Deleted,

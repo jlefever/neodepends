@@ -1,6 +1,9 @@
 #[macro_use]
 extern crate derive_builder;
 
+use core::Change;
+use core::Entity;
+use core::EntityDep;
 use core::PseudoCommitId;
 use std::collections::HashMap;
 use std::env::current_dir;
@@ -24,24 +27,27 @@ use clap_verbosity_flag::Verbosity;
 use depends::DependsConfig;
 use itertools::Itertools;
 use languages::Lang;
-use spec::Pathspec;
+use matrix::dsm_v1;
+use matrix::dsm_v2;
 use resolution::ResolverManager;
+use spec::Pathspec;
 
 use crate::depends::DependsResolverFactory;
 use crate::extraction::Extractor;
-use crate::spec::Filespec;
 use crate::filesystem::FileSystem;
 use crate::resolution::ResolverFactory;
+use crate::spec::Filespec;
 use crate::stackgraphs::StackGraphsResolverFactory;
 
 mod core;
 mod depends;
 mod extraction;
-mod languages;
-mod spec;
 mod filesystem;
+mod languages;
+mod matrix;
 mod resolution;
 mod sparse_vec;
+mod spec;
 mod stackgraphs;
 mod tagging;
 
@@ -95,6 +101,16 @@ impl Opts {
             SubCommandOpts::Entities(c) => &c.pathspec_opts,
             SubCommandOpts::Deps(c) => &c.pathspec_opts,
             SubCommandOpts::Changes(c) => &c.pathspec_opts,
+        }
+    }
+
+    fn file_level(&self) -> bool {
+        match &self.command {
+            SubCommandOpts::Matrix(c) => c.file_level(),
+            SubCommandOpts::Dump(c) => c.level_opts.file_level,
+            SubCommandOpts::Entities(c) => c.level_opts.file_level,
+            SubCommandOpts::Deps(c) => c.level_opts.file_level,
+            SubCommandOpts::Changes(c) => c.level_opts.file_level,
         }
     }
 }
@@ -185,6 +201,8 @@ enum SubCommandOpts {
 #[derive(Debug, Args)]
 struct ExportMatrixOpts {
     /// Format of DSM output
+    /// 
+    /// When --format=dsm-v1, --file-level is implied.
     #[arg(long, default_value_t, value_parser = strum_parser!(MatrixFormat))]
     format: MatrixFormat,
 
@@ -195,17 +213,36 @@ struct ExportMatrixOpts {
     #[clap(flatten)]
     pathspec_opts: PathspecOpts,
 
+    #[clap(flatten)]
+    level_opts: LevelOpts,
+
     #[clap(flatten, next_help_heading = "Dependency Options")]
     resolver_opts: ResolverOpts,
 }
 
+impl ExportMatrixOpts {
+    /// The option --format=dsm-v1 implies --file-level
+    fn file_level(&self) -> bool {
+        self.level_opts.file_level || self.format.is_dsm_v_1()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(strum::Display, strum::EnumString, strum::VariantNames)]
+#[derive(strum::Display, strum::EnumIs, strum::EnumString, strum::VariantNames)]
 #[strum(serialize_all = "kebab-case")]
 enum MatrixFormat {
     DsmV1,
     #[default]
     DsmV2,
+}
+
+impl MatrixFormat {
+    pub fn to_matrix_str(&self, es: &[Entity], ds: &[EntityDep], cs: &[Change]) -> String {
+        match self {
+            MatrixFormat::DsmV1 => dsm_v1(es, ds, cs),
+            MatrixFormat::DsmV2 => dsm_v2(es, ds, cs),
+        }
+    }
 }
 
 /// Export project data as a collection of tables
@@ -222,6 +259,9 @@ struct DumpOpts {
     #[clap(flatten)]
     pathspec_opts: PathspecOpts,
 
+    #[clap(flatten)]
+    level_opts: LevelOpts,
+
     #[clap(flatten, next_help_heading = "Dependency Options")]
     resolver_opts: ResolverOpts,
 }
@@ -235,6 +275,9 @@ struct ListEntitiesOpts {
 
     #[clap(flatten)]
     pathspec_opts: PathspecOpts,
+
+    #[clap(flatten)]
+    level_opts: LevelOpts,
 }
 
 /// Export deps as a table
@@ -249,6 +292,9 @@ struct ListDepsOpts {
 
     #[clap(flatten)]
     pathspec_opts: PathspecOpts,
+
+    #[clap(flatten)]
+    level_opts: LevelOpts,
 }
 
 /// Export changes as a table
@@ -260,6 +306,9 @@ struct ListChangesOpts {
 
     #[clap(flatten)]
     pathspec_opts: PathspecOpts,
+
+    #[clap(flatten)]
+    level_opts: LevelOpts,
 }
 
 #[derive(Debug, Args)]
@@ -292,15 +341,23 @@ struct ResolverOpts {
     ///
     /// When a both tools support a language, Stack Graphs will take priority
     /// over Depends if specified first on the command line.
-    #[arg(short, long, id = "stackgraphs")]
+    #[arg(short, long)]
     stackgraphs: bool,
 
     /// Enable dependency resolution using Depends
     ///
     /// When a both tools support a language, Depends will take priority over
     /// Stack Graphs if specified first on the command line.
-    #[arg(short, long, id = "depends")]
+    #[arg(short, long)]
     depends: bool,
+}
+
+#[derive(Debug, Args)]
+struct LevelOpts {
+    /// Always report at the file-level, even when more fine-grain info is
+    /// available
+    #[arg(long)]
+    file_level: bool,
 }
 
 fn main() -> Result<()> {
@@ -309,14 +366,16 @@ fn main() -> Result<()> {
     env_logger::Builder::new().filter_level(opts.logging_opts.verbose.log_level_filter()).init();
     let fs = FileSystem::open(opts.io_opts.input.clone().unwrap_or(current_dir()?));
     let pathspec = opts.pathspec_opts().pathspec()?;
+    let file_level = opts.file_level();
     let depends_config = opts.depends_opts.to_depends_config();
+
+    let mut extractor = Extractor::new(fs.clone(), file_level);
     let start = Instant::now();
 
     match opts.command {
         SubCommandOpts::Entities(opts) => {
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             let filespec = Filespec::new(commits, pathspec);
-            let extractor = Extractor::new(fs.clone(), ResolverManager::empty());
 
             for entity in extractor.extract_entities(&filespec) {
                 println!("{}", serde_json::to_string(&entity)?);
@@ -325,7 +384,6 @@ fn main() -> Result<()> {
         SubCommandOpts::Changes(opts) => {
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             let filespec = Filespec::new(commits, pathspec);
-            let extractor = Extractor::new(fs.clone(), ResolverManager::empty());
 
             for entity in extractor.extract_changes(&filespec) {
                 println!("{}", serde_json::to_string(&entity)?);
@@ -334,12 +392,30 @@ fn main() -> Result<()> {
         SubCommandOpts::Deps(opts) => {
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             let filespec = Filespec::new(commits, pathspec);
+
+            // Setup resolver
             let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
-            let extractor = Extractor::new(fs.clone(), resolver);
+            extractor.set_resolver(resolver);
 
             for entity in extractor.extract_deps(&filespec) {
                 println!("{}", serde_json::to_string(&entity)?);
             }
+        }
+        SubCommandOpts::Matrix(opts) => {
+            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
+            let dep_commit = commits[0].clone();
+            let dep_filespec = Filespec::new(vec![dep_commit], pathspec.clone());
+            let change_filespec = Filespec::new(commits, pathspec);
+
+            // Setup resolver
+            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
+            extractor.set_resolver(resolver);
+
+            // Extract and print
+            let entities = extractor.extract_entities(&dep_filespec);
+            let deps = extractor.extract_deps(&dep_filespec);
+            let changes = extractor.extract_changes(&change_filespec);
+            println!("{}", opts.format.to_matrix_str(&entities, &deps, &changes));
         }
         _ => (),
     }
@@ -359,7 +435,13 @@ fn try_parse_revspecs(fs: &FileSystem, revspecs: &[String]) -> Result<Vec<Pseudo
         }
     }
 
-    Ok(ids.into_iter().unique().collect())
+    let ids = ids.into_iter().unique().collect_vec();
+
+    if ids.is_empty() {
+        bail!("must provide at least one commit (e.g. HEAD or WORKDIR)");
+    }
+
+    Ok(ids)
 }
 
 fn try_read_file_revspecs(fs: &FileSystem, path: &str) -> Result<Vec<PseudoCommitId>> {
