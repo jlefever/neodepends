@@ -26,12 +26,10 @@ neodepends --help
 ```plaintext
 Scan a project and extract structural and historical information.
 
-If the project is a git repository, rather than pulling files from disk, Neodepends can scan the project as it
-existed in previous commit(s).
+If the project is a git repository, rather than pulling files from disk, Neodepends can scan the project as it existed in previous commit(s).
 
-Dependency resolution can be done with Stack Graphs ('--stackgraphs'), Depends ('--depends'), or both. If both are
-enabled, Neodepends will determine which one to use for a particular language by using whichever one is specified
-first on the command-line. This is only relevant when a language is supported by both Stack Graphs and Depends.
+Dependency resolution can be done with Stack Graphs ('--stackgraphs'), Depends ('--depends'), or both. If both are enabled, Neodepends will determine which one to use for a particular language by using whichever one is
+specified first on the command-line. This is only relevant when a language is supported by both Stack Graphs and Depends.
 
 Usage: neodepends [OPTIONS] <COMMAND>
 
@@ -54,8 +52,7 @@ I/O Options:
   -i, --input <INPUT>
           The root of the project/repository to scan.
           
-          If not specified, will use the current working directory. If no git repository is found, then Neodepends is
-          placed in "disk-only" mode and will read directly from the file system.
+          If not specified, will use the current working directory. If no git repository is found, then Neodepends is placed in "disk-only" mode and will read directly from the file system.
 
   -o, --output <OUTPUT>
           The path of the output file.
@@ -86,6 +83,5 @@ Depends Options:
       --depends-xmx <DEPENDS_XMX>
           Maximum size of the Java memory allocation pool when running Depends.
           
-          Passed with "-Xmx" to the Java executable. Useful for large projects that cause Depends to run out of
-          memory. For example, "12G" for a twelve gigabyte memory allocation pool.
+          Passed with "-Xmx" to the Java executable. Useful for large projects that cause Depends to run out of memory. For example, "12G" for a twelve gigabyte memory allocation pool.
 ```
