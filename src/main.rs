@@ -353,14 +353,14 @@ impl PathspecOpts {
 struct ResolverOpts {
     /// Enable dependency resolution using Stack Graphs
     ///
-    /// When a both tools support a language, Stack Graphs will take priority
+    /// When both tools support a language, Stack Graphs will take priority
     /// over Depends if specified first on the command line.
     #[arg(short, long)]
     stackgraphs: bool,
 
     /// Enable dependency resolution using Depends
     ///
-    /// When a both tools support a language, Depends will take priority over
+    /// When both tools support a language, Depends will take priority over
     /// Stack Graphs if specified first on the command line.
     #[arg(short, long)]
     depends: bool,
