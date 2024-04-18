@@ -1,5 +1,5 @@
 //! Used to interface with Depends
-//! 
+//!
 //! See https://github.com/multilang-depends/depends
 
 use std::collections::HashSet;
@@ -187,7 +187,7 @@ impl DependsCell {
     fn iter_filename_deps(self, commit_id: PseudoCommitId) -> impl Iterator<Item = FilenameDep> {
         self.details
             .into_iter()
-            .flat_map(move |d| d.into_iter().map(move |d| d.into_filename_dep(commit_id)))
+            .flat_map(move |d| d.into_iter().filter_map(move |d| d.into_filename_dep(commit_id)))
     }
 }
 
@@ -204,12 +204,12 @@ struct DependsDetail {
 }
 
 impl DependsDetail {
-    fn into_filename_dep(self, commit_id: PseudoCommitId) -> FilenameDep {
-        let src = self.src.into_filename_endpoint();
-        let tgt = self.tgt.into_filename_endpoint();
+    fn into_filename_dep(self, commit_id: PseudoCommitId) -> Option<FilenameDep> {
+        let src = self.src.into_filename_endpoint()?;
+        let tgt = self.tgt.into_filename_endpoint()?;
         let position = src.position;
         let kind = self.kind.strip_suffix("(possible)").unwrap_or(&self.kind);
-        FilenameDep::new(src, tgt, kind.try_into().unwrap(), position, commit_id)
+        Some(FilenameDep::new(src, tgt, kind.try_into().unwrap(), position, commit_id))
     }
 }
 
@@ -223,7 +223,16 @@ struct DependsEndpoint {
 }
 
 impl DependsEndpoint {
-    fn into_filename_endpoint(self) -> FilenameEndpoint {
-        FilenameEndpoint::new(self.filename, PartialPosition::Row(self.line - 1))
+    fn into_filename_endpoint(self) -> Option<FilenameEndpoint> {
+        if self.line != 0 {
+            // The "line number" from Depends starts counting at 1, whereas our "row" starts
+            // counting at 0.
+            let row = PartialPosition::Row(self.line - 1);
+            Some(FilenameEndpoint::new(self.filename, row))
+        } else {
+            // A line number of 0 means Depends does not know the line number. We ignore
+            // these.
+            None
+        }
     }
 }
