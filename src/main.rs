@@ -6,6 +6,7 @@ use core::Entity;
 use core::EntityDep;
 use core::PseudoCommitId;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
@@ -31,13 +32,18 @@ use matrix::dsm_v1;
 use matrix::dsm_v2;
 use resolution::ResolverManager;
 use spec::Pathspec;
+use tables::Table;
 
+use crate::core::Content;
 use crate::depends::DependsResolverFactory;
 use crate::extraction::Extractor;
+use crate::filesystem::FileReader;
 use crate::filesystem::FileSystem;
 use crate::resolution::ResolverFactory;
 use crate::spec::Filespec;
 use crate::stackgraphs::StackGraphsResolverFactory;
+use crate::tables::CsvWriter;
+use crate::tables::TableWriter;
 
 mod core;
 mod depends;
@@ -49,6 +55,7 @@ mod resolution;
 mod sparse_vec;
 mod spec;
 mod stackgraphs;
+mod tables;
 mod tagging;
 
 /// Allow an enum to be used on the command-line as long as the enum implements
@@ -97,6 +104,7 @@ impl Opts {
     fn pathspec_opts(&self) -> &PathspecOpts {
         match &self.command {
             SubCommandOpts::Matrix(c) => &c.pathspec_opts,
+            SubCommandOpts::Tables(c) => &c.pathspec_opts,
             SubCommandOpts::Dump(c) => &c.pathspec_opts,
             SubCommandOpts::Entities(c) => &c.pathspec_opts,
             SubCommandOpts::Deps(c) => &c.pathspec_opts,
@@ -107,6 +115,7 @@ impl Opts {
     fn file_level(&self) -> bool {
         match &self.command {
             SubCommandOpts::Matrix(c) => c.file_level(),
+            SubCommandOpts::Tables(c) => c.level_opts.file_level,
             SubCommandOpts::Dump(c) => c.level_opts.file_level,
             SubCommandOpts::Entities(c) => c.level_opts.file_level,
             SubCommandOpts::Deps(c) => c.level_opts.file_level,
@@ -141,12 +150,50 @@ impl IoOpts {
         Ok(self.input.clone().unwrap_or(std::env::current_dir()?))
     }
 
+    fn prepare_output(&self) -> Result<()> {
+        if self.output.is_none() {
+            return Ok(());
+        }
+
+        let path = self.output.as_deref().unwrap();
+        let path_str = path.to_string_lossy();
+
+        if !path.exists() {
+            return Ok(());
+        }
+
+        match (path.is_file(), self.force) {
+            (true, true) => {
+                log::info!("Removing existing file at {}", &path_str);
+                std::fs::remove_file(path)?;
+            }
+            (true, false) => {
+                panic!("File already exists at {}. Use --force to overwrite it.", &path_str);
+            }
+            (false, true) => {
+                panic!(
+                    "Directory already exists at {}, but the --force flag can only overwrite \
+                     files. Please delete the directory before running neodepends.",
+                    &path_str
+                );
+            }
+            (false, false) => {
+                panic!(
+                    "Directory already exists at {}. Please delete the directory before running \
+                     neodepends.",
+                    &path_str
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn create_writer(&self) -> Result<Box<dyn Write>> {
-        Ok(match (&self.output, self.force) {
-            (Some(path), false) => Box::new(File::create_new(path)?),
-            (Some(path), true) => Box::new(File::create(path)?),
-            _ => Box::new(std::io::stdout()),
-        })
+        match &self.output {
+            Some(path) => Ok(Box::new(File::create(path)?)),
+            None => Ok(Box::new(std::io::stdout())),
+        }
     }
 }
 
@@ -193,6 +240,7 @@ impl DependsOpts {
 #[derive(Debug, Subcommand)]
 enum SubCommandOpts {
     Matrix(ExportMatrixOpts),
+    Tables(ExportTablesOpts),
     Dump(DumpOpts),
     Entities(ListEntitiesOpts),
     Deps(ListDepsOpts),
@@ -257,6 +305,62 @@ impl MatrixFormat {
             MatrixFormat::DsmV2 => dsm_v2(es, ds, cs),
         }
     }
+}
+
+/// Export project data as a collection of tables.
+///
+/// If --format=parquet or --format=csv, then a directory will be created at
+/// --output with a .parquet or .csv file for each table. If --format=sqlite,
+/// then a sqlite database file will be created at --output. In either case,
+/// --output must be specified. Tables cannot be exported through stdout.
+///
+/// Similar to the matrix subcommand, dependencies will only be extracted from
+/// the first commit specified. If there is no first commit, then entities and
+/// dependencies will be collected from WORKDIR.
+#[derive(Debug, Args)]
+struct ExportTablesOpts {
+    /// Format of tabular output
+    #[arg(long, default_value_t, value_parser = strum_parser!(TabularFormat))]
+    format: TabularFormat,
+
+    /// Only extract and export the provided tables
+    ///
+    /// Otherwise, all supported tables will be exported.
+    #[arg(short, long, value_delimiter = ',', value_parser = strum_parser!(Table))]
+    tables: Vec<Table>,
+
+    /// Commits to be scanned
+    #[arg(value_name = "COMMIT")]
+    revspecs: Vec<String>,
+
+    #[clap(flatten)]
+    pathspec_opts: PathspecOpts,
+
+    #[clap(flatten)]
+    level_opts: LevelOpts,
+
+    #[clap(flatten, next_help_heading = "Dependency Options")]
+    resolver_opts: ResolverOpts,
+}
+
+impl ExportTablesOpts {
+    fn contains(&self, table: &Table) -> bool {
+        if self.tables.is_empty() {
+            true
+        } else {
+            self.tables.contains(table)
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(strum::Display, strum::EnumIs, strum::EnumString, strum::VariantNames)]
+#[strum(serialize_all = "kebab-case")]
+enum TabularFormat {
+    Parquet,
+    Sqlite,
+    #[default]
+    Csv,
 }
 
 /// Export project data as a collection of tables
@@ -377,18 +481,21 @@ struct LevelOpts {
 fn main() -> Result<()> {
     let matches = Opts::command().get_matches();
     let opts = Opts::from_arg_matches(&matches)?;
+    let io_opts = &opts.io_opts;
+    let output_path = opts.io_opts.output.clone();
     env_logger::Builder::new().filter_level(opts.logging_opts.verbose.log_level_filter()).init();
     let fs = FileSystem::open(opts.io_opts.input()?)?;
     let pathspec = opts.pathspec_opts().pathspec()?;
     let file_level = opts.file_level();
     let depends_config = opts.depends_opts.to_depends_config();
+    io_opts.prepare_output()?;
 
-    let mut writer = opts.io_opts.create_writer()?;
     let mut extractor = Extractor::new(fs.clone(), file_level);
     let start = Instant::now();
 
     match opts.command {
         SubCommandOpts::Matrix(opts) => {
+            let mut writer = io_opts.create_writer()?;
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             ensure_nonempty(&commits)?;
             let dep_commit = commits[0].clone();
@@ -403,7 +510,54 @@ fn main() -> Result<()> {
             let changes = extractor.extract_changes(&change_filespec);
             writer.write_all(opts.format.to_matrix_str(&entities, &deps, &changes).as_bytes())?;
         }
+        SubCommandOpts::Tables(opts) => {
+            let output_path = output_path.expect("--output must be specified");
+
+            if !opts.format.is_csv() {
+                panic!("only csv output is currently supported")
+            }
+
+            let writer = CsvWriter::open(output_path)?;
+
+            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
+            ensure_nonempty(&commits)?;
+            let dep_commit = commits[0].clone();
+            let dep_filespec = Filespec::new(vec![dep_commit], pathspec.clone());
+            let change_filespec = Filespec::new(commits, pathspec);
+
+            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
+            extractor.set_resolver(resolver);
+
+            let mut content_ids = HashSet::new();
+
+            if opts.contains(&Table::Entities) {
+                log::info!("Extracting and writing entities table...");
+                let entities = extractor.extract_entities(&dep_filespec);
+                content_ids.extend(entities.iter().map(|e| e.content_id));
+                writer.write_entities(entities)?;
+            }
+
+            if opts.contains(&Table::Deps) {
+                log::info!("Extracting and writing deps table...");
+                let deps = extractor.extract_deps(&dep_filespec);
+                writer.write_deps(deps)?;
+            }
+
+            if opts.contains(&Table::Changes) {
+                log::info!("Extracting and writing changes table...");
+                let changes = extractor.extract_changes(&change_filespec);
+                writer.write_changes(changes)?;
+            }
+
+            if opts.contains(&Table::Contents) {
+                log::info!("Extracting and writing contents table...");
+                let contents =
+                    content_ids.into_iter().map(|id| Content::new(id, fs.read(id).unwrap()));
+                writer.write_contents(contents)?;
+            }
+        }
         SubCommandOpts::Dump(opts) => {
+            let mut writer = io_opts.create_writer()?;
             let dep_commits = try_parse_revspecs(&fs, &opts.structure)?;
             let change_commits = try_parse_revspecs(&fs, &opts.history)?;
             let dep_filespec = Filespec::new(dep_commits, pathspec.clone());
@@ -417,12 +571,14 @@ fn main() -> Result<()> {
             write_jsonl(&mut writer, &extractor.extract_changes(&change_filespec));
         }
         SubCommandOpts::Entities(opts) => {
+            let mut writer = io_opts.create_writer()?;
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             ensure_nonempty(&commits)?;
             let filespec = Filespec::new(commits, pathspec);
             write_jsonl(&mut writer, &extractor.extract_entities(&filespec));
         }
         SubCommandOpts::Deps(opts) => {
+            let mut writer = io_opts.create_writer()?;
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             ensure_nonempty(&commits)?;
             let filespec = Filespec::new(commits, pathspec);
@@ -433,6 +589,7 @@ fn main() -> Result<()> {
             write_jsonl(&mut writer, &extractor.extract_deps(&filespec));
         }
         SubCommandOpts::Changes(opts) => {
+            let mut writer = io_opts.create_writer()?;
             let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
             ensure_nonempty(&commits)?;
             let filespec = Filespec::new(commits, pathspec);

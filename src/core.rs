@@ -536,6 +536,20 @@ impl Entity {
     }
 }
 
+/// The content of a file
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize)]
+pub struct Content {
+    pub id: ContentId,
+    pub content: String,
+}
+
+impl Content {
+    pub fn new(id: ContentId, content: String) -> Self {
+        Self { id, content }
+    }
+}
+
 /// A number representing the type of an [Dep].
 ///
 /// Most languages use only a subset of these.

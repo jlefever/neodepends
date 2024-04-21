@@ -75,10 +75,15 @@ impl DependsResolver {
 
 impl Resolver for DependsResolver {
     fn add_file(&self, filename: &str, content: &str) {
+        let file_key = FileKey::from_content(filename.to_string(), content);
+
+        if self.files.read().unwrap().contains(&file_key) {
+            panic!("attempted to add two files with identical filenames");
+        }
+
         let path = self.temp_dir.as_ref().join(filename);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::File::create_new(path).unwrap().write_all(content.as_bytes()).unwrap();
-        let file_key = FileKey::from_content(filename.to_string(), content);
+        std::fs::File::create(path).unwrap().write_all(content.as_bytes()).unwrap();
         self.files.write().unwrap().insert(file_key);
     }
 
