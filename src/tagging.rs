@@ -107,7 +107,6 @@ impl LocationTable {
 
     fn find_id(&self, position: PartialPosition) -> Option<EntityId> {
         match position {
-            PartialPosition::Byte(byte) => self.bytes.get(byte),
             PartialPosition::Row(row) => self.rows.get(row),
             PartialPosition::Whole(whole) => self.bytes.get(whole.byte),
         }
@@ -115,7 +114,6 @@ impl LocationTable {
 
     fn find_ids(&self, span: PartialSpan) -> Counter<EntityId> {
         match span {
-            PartialSpan::Byte(start, end) => self.bytes.get_overlaps(start, end),
             PartialSpan::Row(start, end) => self.rows.get_overlaps(start, end),
             PartialSpan::Whole(whole) => self.bytes.get_overlaps(whole.start.byte, whole.end.byte),
         }

@@ -337,24 +337,96 @@ impl From<&lsp_positions::Span> for Span {
     }
 }
 
-/// Like [Position] but it is possible that only the byte or row is known.
+/// Like [Position] but it is possible that only the row is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartialPosition {
-    Byte(usize),
     Row(usize),
     Whole(Position),
 }
 
-/// Like [Span] but it is possible that only the bytes or rows are known.
+impl PartialPosition {
+    pub fn byte(&self) -> Option<usize> {
+        match self {
+            PartialPosition::Whole(w) => Some(w.byte),
+            _ => None,
+        }
+    }
+
+    pub fn row(&self) -> usize {
+        match self {
+            PartialPosition::Row(r) => *r,
+            PartialPosition::Whole(w) => w.row,
+        }
+    }
+
+    pub fn column(&self) -> Option<usize> {
+        match self {
+            PartialPosition::Whole(w) => Some(w.column),
+            _ => None,
+        }
+    }
+}
+
+/// Like [Span] but it is possible that only the rows are known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartialSpan {
-    Byte(usize, usize),
     Row(usize, usize),
+    #[allow(dead_code)]
     Whole(Span),
+}
+
+impl PartialSpan {
+    #[allow(dead_code)]
+    pub fn start_byte(&self) -> Option<usize> {
+        match self {
+            PartialSpan::Whole(w) => Some(w.start.byte),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn start_row(&self) -> usize {
+        match self {
+            PartialSpan::Row(s, _) => *s,
+            PartialSpan::Whole(w) => w.start.row,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn start_column(&self) -> Option<usize> {
+        match self {
+            PartialSpan::Whole(w) => Some(w.start.column),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn end_byte(&self) -> Option<usize> {
+        match self {
+            PartialSpan::Whole(w) => Some(w.end.byte),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn end_row(&self) -> usize {
+        match self {
+            PartialSpan::Row(s, _) => *s,
+            PartialSpan::Whole(w) => w.end.row,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn end_column(&self) -> Option<usize> {
+        match self {
+            PartialSpan::Whole(w) => Some(w.end.column),
+            _ => None,
+        }
+    }
 }
 
 /// A number representing the type of an [Entity].
