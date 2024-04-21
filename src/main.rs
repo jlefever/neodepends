@@ -378,7 +378,7 @@ fn main() -> Result<()> {
     let matches = Opts::command().get_matches();
     let opts = Opts::from_arg_matches(&matches)?;
     env_logger::Builder::new().filter_level(opts.logging_opts.verbose.log_level_filter()).init();
-    let fs = FileSystem::open(opts.io_opts.input()?);
+    let fs = FileSystem::open(opts.io_opts.input()?)?;
     let pathspec = opts.pathspec_opts().pathspec()?;
     let file_level = opts.file_level();
     let depends_config = opts.depends_opts.to_depends_config();

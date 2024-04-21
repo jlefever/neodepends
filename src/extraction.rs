@@ -80,7 +80,7 @@ impl Extractor {
                 return (f, entity_set.clone());
             }
 
-            let content = self.fs.read(&f).unwrap();
+            let content = self.fs.read(f.content_id).unwrap();
             let lang = Lang::of(&f.filename).unwrap();
             let entity_set = lang.tagger().tag(&f.filename, &content, self.file_level);
             self.entity_sets.write().unwrap().insert(f.clone(), entity_set.clone());

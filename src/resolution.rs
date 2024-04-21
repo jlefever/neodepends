@@ -88,7 +88,7 @@ impl ResolverManager {
 
         // Iterate through the files and add each one to their associated resolvers
         lookup.into_par_iter().for_each(|(f, resolvers)| {
-            let content = reader.read(f).unwrap();
+            let content = reader.read(f.content_id).unwrap();
             resolvers.into_par_iter().for_each(|r| r.add_file(&f.filename, &content));
         });
 

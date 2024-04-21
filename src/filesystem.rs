@@ -1,4 +1,3 @@
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -40,7 +39,7 @@ impl FileSystem {
     ///
     /// Will open a git repository if one exists at this directory. Otherwise,
     /// it will open in "disk-only" mode.
-    pub fn open<P: AsRef<Path>>(root: P) -> Self {
+    pub fn open<P: AsRef<Path>>(root: P) -> Result<Self> {
         let mut root = root.as_ref().to_path_buf();
         let repo = Repository::open(&root).ok();
 
@@ -51,7 +50,7 @@ impl FileSystem {
         }
 
         log::info!("Project opened at: {}", root.to_string_lossy());
-        Self { disk: Disk::open(root), repo }
+        Ok(Self { disk: Disk::open(root)?, repo })
     }
 
     /// Attempt to parse a revspec as a [PseudoCommitId].
@@ -107,14 +106,14 @@ impl FileSystem {
     }
 
     /// Read the contents of a file as a UTF-8 String.
-    fn read_to_string(&self, file_key: &FileKey) -> Result<String> {
-        String::from_utf8(self.read_to_vec(file_key)?).context("invalid UTF-8")
+    fn read_to_string(&self, content_id: ContentId) -> Result<String> {
+        String::from_utf8(self.read_to_vec(content_id)?).context("invalid UTF-8")
     }
 
     /// Read the contents of a file as a vec of bytes.
-    fn read_to_vec(&self, file_key: &FileKey) -> Result<Vec<u8>> {
+    fn read_to_vec(&self, content_id: ContentId) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.read_buf(file_key, &mut buf)?;
+        self.read_buf(content_id, &mut buf)?;
         Ok(buf)
     }
 
@@ -123,19 +122,10 @@ impl FileSystem {
     /// Will first try to find the file in the git repository. If it can't be
     /// found, it will look for it on disk. If [FileSystem] is in disk-only
     /// mode, it will only try loading from the disk.
-    fn read_buf(&self, file_key: &FileKey, buf: &mut Vec<u8>) -> Result<()> {
-        match self.repo.as_ref().map(|r| r.read_buf(file_key.content_id, buf)) {
+    fn read_buf(&self, content_id: ContentId, buf: &mut Vec<u8>) -> Result<()> {
+        match self.repo.as_ref().map(|r| r.read_buf(content_id, buf)) {
             Some(Ok(())) => Ok(()),
-            _ => {
-                self.disk.read_buf(&file_key.filename, buf)?;
-
-                // Sanity check that may hurt performance but gives some peace-of-mind
-                if file_key.content_id != ContentId::from_path(&file_key.filename) {
-                    bail!("failed to correctly read file")
-                }
-
-                Ok(())
-            }
+            _ => self.disk.read_buf(content_id, buf),
         }
     }
 }
@@ -145,12 +135,12 @@ impl FileSystem {
 /// Only implementation is [FileSystem]. Mainly useful to allow other code to
 /// not explicitly depend on FileSystem.
 pub trait FileReader: Send + Sync {
-    fn read<F: Borrow<FileKey>>(&self, file_key: F) -> Result<String>;
+    fn read(&self, content_id: ContentId) -> Result<String>;
 }
 
 impl FileReader for FileSystem {
-    fn read<F: Borrow<FileKey>>(&self, file_key: F) -> Result<String> {
-        self.read_to_string(file_key.borrow())
+    fn read(&self, content_id: ContentId) -> Result<String> {
+        self.read_to_string(content_id)
     }
 }
 
@@ -222,18 +212,29 @@ impl Debug for Repository {
 #[derive(Debug, Clone)]
 struct Disk {
     root: PathBuf,
+    file_set: FileSet,
 }
 
 impl Disk {
-    fn open<P: AsRef<Path>>(root: P) -> Self {
-        Self { root: root.as_ref().to_path_buf() }
+    fn open<P: AsRef<Path>>(root: P) -> Result<Self> {
+        let file_set = FileSet::new(walk_dir(root.as_ref(), &Pathspec::default())?);
+        Ok(Self { root: root.as_ref().to_path_buf(), file_set })
     }
 
     fn list(&self, pathspec: &Pathspec) -> Result<FileSet> {
         Ok(FileSet::new(walk_dir(&self.root, pathspec)?))
     }
 
-    fn read_buf<P: AsRef<Path>>(&self, filename: P, buf: &mut Vec<u8>) -> Result<()> {
+    fn read_buf(&self, content_id: ContentId, buf: &mut Vec<u8>) -> Result<()> {
+        let filename = self
+            .file_set
+            .get_filenames(content_id)
+            .next()
+            .context("could not find file with matching id")?;
+        self.read_buf_by_filename(filename, buf)
+    }
+
+    fn read_buf_by_filename<P: AsRef<Path>>(&self, filename: P, buf: &mut Vec<u8>) -> Result<()> {
         File::open(self.root.join(filename))?.read_to_end(buf)?;
         Ok(())
     }
@@ -249,11 +250,12 @@ fn walk_dir<P: AsRef<Path>>(root: P, pathspec: &Pathspec) -> Result<Vec<FileKey>
     for entry in WalkDir::new(root.as_ref()).follow_links(true) {
         match entry {
             Ok(entry) => {
-                let path = entry.path().strip_prefix(root.as_ref())?.to_string_lossy().to_string();
+                let path = entry.path().strip_prefix(root.as_ref())?;
 
-                if !path.is_empty() && pathspec.matches(&path) {
+                if path.is_file() && pathspec.matches(&path) {
                     let content_id = ContentId::from_path(&path);
-                    keys.push(FileKey::new(path, content_id));
+                    let filename = path.to_string_lossy().to_string();
+                    keys.push(FileKey::new(filename, content_id));
                 }
             }
             Err(err) => {

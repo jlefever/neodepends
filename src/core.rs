@@ -184,6 +184,7 @@ impl FileKey {
 pub struct FileSet {
     file_keys: Vec<FileKey>,
     filenames: HashMap<String, usize>,
+    content_ids: HashMap<ContentId, Vec<usize>>,
 }
 
 impl FileSet {
@@ -193,14 +194,17 @@ impl FileSet {
     pub fn new<I: IntoIterator<Item = FileKey>>(file_keys: I) -> Self {
         let file_keys = file_keys.into_iter().sorted().collect_vec();
         let mut filenames = HashMap::with_capacity(file_keys.len());
+        let mut content_ids: HashMap<_, Vec<_>> = HashMap::with_capacity(file_keys.len());
 
         for (i, file_key) in file_keys.iter().enumerate() {
             if let Some(_) = filenames.insert(file_key.filename.clone(), i) {
                 panic!("filenames must be unique");
             }
+
+            content_ids.entry(file_key.content_id).or_default().push(i);
         }
 
-        Self { file_keys, filenames }
+        Self { file_keys, filenames, content_ids }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &FileKey> {
@@ -213,6 +217,13 @@ impl FileSet {
 
     pub fn get_content_id<S: AsRef<str>>(&self, filename: S) -> Option<ContentId> {
         self.get(filename).map(|f| f.content_id)
+    }
+
+    pub fn get_filenames(&self, content_id: ContentId) -> impl Iterator<Item = &str> {
+        self.content_ids
+            .get(&content_id)
+            .into_iter()
+            .flat_map(|x| x.iter().map(|&i| self.file_keys[i].filename.as_str()))
     }
 }
 
