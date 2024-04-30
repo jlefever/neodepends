@@ -141,6 +141,8 @@ struct Opts {
     input: Option<PathBuf>,
 
     /// Format of tabular output.
+    /// 
+    /// If not specified, will try to infer from the file extension of the output.
     #[arg(long, value_parser = strum_parser!(OutputFormat))]
     format: Option<OutputFormat>,
 
@@ -260,14 +262,14 @@ struct ResolverOpts {
     ///
     /// When a both tools support a language, Stack Graphs will take priority
     /// over Depends if specified first on the command line.
-    #[arg(short, long)]
+    #[arg(short = 'S', long)]
     stackgraphs: bool,
 
     /// Enable dependency resolution using Depends
     ///
     /// When a both tools support a language, Depends will take priority over
     /// Stack Graphs if specified first on the command line.
-    #[arg(short, long)]
+    #[arg(short = 'D', long)]
     depends: bool,
 }
 
@@ -281,7 +283,6 @@ fn main() -> Result<()> {
     let mut extractor = Extractor::new(fs.clone(), opts.file_level);
     extractor.set_resolver(create_resolver(&matches, depends_config));
 
-    // Parse commits
     let mut structure_commits = try_parse_revspecs(&fs, &opts.structure)?;
     let history_commits = try_parse_revspecs(&fs, &opts.revspecs)?;
 
@@ -292,8 +293,12 @@ fn main() -> Result<()> {
         structure_commits.push(history_commits[0].clone());
     }
 
+    prepare_output(&opts.output, opts.force);
     let output_path = opts.output.clone();
-    let mut writer = opts.format.unwrap().open(output_path)?;
+    let mut writer = match opts.format {
+        Some(format) => format.open(output_path)?,
+        None => infer_format(&output_path)?.open(output_path)?,
+    };
 
     if structure_commits.len() > 1 && writer.is_single_structure() {
         bail!("Selected output format can only take the structural information of a single commit")
@@ -301,7 +306,6 @@ fn main() -> Result<()> {
 
     let structure_filespec = Filespec::new(structure_commits, pathspec.clone());
     let history_filespec = Filespec::new(history_commits, pathspec);
-    prepare_output(&opts.output, opts.force);
     let start = Instant::now();
 
     let should_extract = |resource: Resource| writer.supports(resource) && opts.contains(resource);
@@ -337,6 +341,14 @@ fn main() -> Result<()> {
     writer.finalize()?;
     log::info!("Finished in {}ms", start.elapsed().as_millis());
     Ok(())
+}
+
+fn infer_format<P: AsRef<Path>>(output: P) -> Result<OutputFormat> {
+    output.as_ref().extension().and_then(|e| match e.to_ascii_lowercase().to_str() {
+        Some("json") => Some(OutputFormat::DsmV2),
+        Some("jsonl") => Some(OutputFormat::Jsonl),
+        _ => None
+    }).context("Could not infer file format. Use --format to specify.")
 }
 
 fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
