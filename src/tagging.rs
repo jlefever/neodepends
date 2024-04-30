@@ -265,8 +265,15 @@ fn collect_ancestor_ids(node: &Node) -> Vec<CaptureId> {
 }
 
 fn to_singleton_entity_set(filename: &str, content: &str) -> EntitySet {
-    let (end_row, end_line) = content.split_inclusive('\n').enumerate().last().unwrap();
-    let end_position = Position::new(content.len() - 1, end_row, end_line.len());
+    let last = content.split_inclusive('\n').enumerate().last();
+
+    let (end_row, end_col) = if let Some((end_row, end_line)) = last {
+        (end_row, end_line.len())
+    } else {
+        (0, 0)
+    };
+
+    let end_position = Position::new(content.len(), end_row, end_col);
     let capture = Capture::singleton(filename, end_position);
     let mut captures = HashMap::with_capacity(1);
     captures.insert(capture.id, capture);
