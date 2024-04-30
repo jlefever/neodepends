@@ -245,8 +245,12 @@ impl MultiFileSet {
         Self { files, file_sets }
     }
 
-    pub fn files(&self) -> impl Iterator<Item = &FileKey> {
-        self.files.iter()
+    pub fn files(&self) -> &HashSet<FileKey> {
+        &self.files
+    }
+
+    pub fn into_files(self) -> HashSet<FileKey> {
+        self.files
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&PseudoCommitId, &FileSet)> {

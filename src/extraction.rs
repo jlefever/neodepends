@@ -7,6 +7,7 @@ use itertools::Itertools;
 use rayon::prelude::*;
 
 use crate::core::Change;
+use crate::core::Content;
 use crate::core::Diff;
 use crate::core::Entity;
 use crate::core::EntityDep;
@@ -35,16 +36,16 @@ impl Extractor {
         self.resolver = resolver;
     }
 
-    pub fn extract_entities(&self, spec: &Filespec) -> Vec<Entity> {
-        let files = self.fs.list(spec).files().sorted().cloned().collect::<HashSet<_>>();
-        self.collect_entity_sets(files)
-            .into_iter()
-            .sorted_by_key(|(f, _)| f.clone())
-            .flat_map(|(_, e)| e.into_entities_vec())
-            .collect()
+    pub fn extract_entities(&self, spec: &Filespec) -> impl ParallelIterator<Item = Entity> + '_ {
+        let files = self.fs.list(spec);
+        self.ensure_entity_sets(files.files().iter().sorted().cloned().collect());
+
+        files.into_files().into_par_iter().flat_map(|f| {
+            self.entity_sets.read().unwrap().get(&f).unwrap().clone().into_entities_vec()
+        })
     }
 
-    pub fn extract_changes(&self, spec: &Filespec) -> Vec<Change> {
+    pub fn extract_changes(&self, spec: &Filespec) -> impl ParallelIterator<Item = Change> + '_ {
         let diffs: Vec<_> = spec
             .commits
             .par_iter()
@@ -52,39 +53,34 @@ impl Extractor {
             .flat_map(|c| self.fs.diff(c, &spec.pathspec).unwrap())
             .collect();
         let files = diffs.iter().flat_map(|d| d.iter_file_keys().cloned()).collect();
-        let entity_sets = self.collect_entity_sets(files);
-        diffs.into_par_iter().flat_map(move |d| calc_changes(&entity_sets, &d)).collect()
+        self.ensure_entity_sets(files);
+        diffs.into_par_iter().flat_map(move |d| calc_changes(&self.entity_sets.read().unwrap(), &d))
     }
 
-    pub fn extract_deps(&self, spec: &Filespec) -> Vec<EntityDep> {
+    pub fn extract_deps(&self, spec: &Filespec) -> impl ParallelIterator<Item = EntityDep> + '_ {
         let files = self.fs.list(spec);
-        let entity_sets = self.collect_entity_sets(files.files().cloned().collect());
+        self.ensure_entity_sets(files.files().iter().cloned().collect());
         self.resolver
             .resolve(&self.fs, &files)
             .into_par_iter()
-            .map(move |d| d.to_entity_dep(&entity_sets).unwrap())
+            .map(move |d| d.to_entity_dep(&self.entity_sets.read().unwrap()).unwrap())
             .filter(|d| !d.is_loop())
-            .collect()
     }
 
-    fn collect_entity_sets(&self, files: HashSet<FileKey>) -> HashMap<FileKey, EntitySet> {
-        self.iter_entity_sets(files).into_par_iter().collect()
+    pub fn extract_contents(&self, spec: &Filespec) -> impl ParallelIterator<Item = Content> + '_ {
+        let content_ids: HashSet<_> =
+            self.fs.list(spec).files().iter().map(|f| f.content_id).collect();
+        content_ids.into_par_iter().map(|id| Content::new(id, self.fs.read(id).unwrap()))
     }
 
-    fn iter_entity_sets(
-        &self,
-        files: HashSet<FileKey>,
-    ) -> impl ParallelIterator<Item = (FileKey, EntitySet)> + '_ {
-        files.into_par_iter().map(|f| {
-            if let Some(entity_set) = self.entity_sets.read().unwrap().get(&f) {
-                return (f, entity_set.clone());
+    fn ensure_entity_sets(&self, files: HashSet<FileKey>) {
+        files.into_par_iter().for_each(|f| {
+            if !self.entity_sets.read().unwrap().contains_key(&f) {
+                let content = self.fs.read(f.content_id).unwrap();
+                let lang = Lang::of(&f.filename).unwrap();
+                let entity_set = lang.tagger().tag(&f.filename, &content, self.file_level);
+                self.entity_sets.write().unwrap().insert(f, entity_set);
             }
-
-            let content = self.fs.read(f.content_id).unwrap();
-            let lang = Lang::of(&f.filename).unwrap();
-            let entity_set = lang.tagger().tag(&f.filename, &content, self.file_level);
-            self.entity_sets.write().unwrap().insert(f.clone(), entity_set.clone());
-            (f, entity_set)
         })
     }
 }

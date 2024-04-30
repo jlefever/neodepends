@@ -1,15 +1,11 @@
 #[macro_use]
 extern crate derive_builder;
 
-use core::Change;
-use core::Entity;
-use core::EntityDep;
 use core::PseudoCommitId;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
-use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -22,28 +18,23 @@ use clap::Args;
 use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Parser;
-use clap::Subcommand;
 use clap_verbosity_flag::InfoLevel;
 use clap_verbosity_flag::Verbosity;
 use depends::DependsConfig;
 use itertools::Itertools;
 use languages::Lang;
-use matrix::dsm_v1;
-use matrix::dsm_v2;
+use output::OutputFormat;
+use output::Resource;
+use rayon::prelude::*;
 use resolution::ResolverManager;
 use spec::Pathspec;
-use tables::Table;
 
-use crate::core::Content;
 use crate::depends::DependsResolverFactory;
 use crate::extraction::Extractor;
-use crate::filesystem::FileReader;
 use crate::filesystem::FileSystem;
 use crate::resolution::ResolverFactory;
 use crate::spec::Filespec;
 use crate::stackgraphs::StackGraphsResolverFactory;
-use crate::tables::CsvWriter;
-use crate::tables::TableWriter;
 
 mod core;
 mod depends;
@@ -51,11 +42,11 @@ mod extraction;
 mod filesystem;
 mod languages;
 mod matrix;
+mod output;
 mod resolution;
 mod sparse_vec;
 mod spec;
 mod stackgraphs;
-mod tables;
 mod tagging;
 
 /// Allow an enum to be used on the command-line as long as the enum implements
@@ -76,123 +67,125 @@ macro_rules! strum_parser {
 
 /// Scan a project and extract structural and historical information.
 ///
-/// If the project is a git repository, rather than pulling files from disk,
-/// Neodepends can scan the project as it existed in previous commit(s).
+/// Neodepends can export the following "resources":
 ///
-/// Dependency resolution can be done with Stack Graphs ('--stackgraphs'),
-/// Depends ('--depends'), or both. If both are enabled, Neodepends will
+/// - Entities: Source code entities like classes, methods, etc.
+///
+/// - Deps: Syntactic dependencies between entities (like method calls)
+///
+/// - Changes: Records of a particular commit changing a particular entity
+///
+/// - Contents: Textual content of source files
+///
+/// Entities, deps, and contents and considered "structural" resources, while
+/// changes are considered "historical" resources.
+/// 
+/// For examples,
+///
+/// $ neodepends --output=out.jsonl --format=jsonl --depends WORKDIR
+///
+/// will create out.jsonl with one resource per line where each resource comes
+/// from the working directory (WORKDIR). If the project is a git repository,
+/// Neodepends can also extract resources from one or more commits. For example,
+///
+/// $ neodepends --output=out.jsonl --format=jsonl --depends $(git rev-list HEAD -n 100)
+///
+/// will scan the most recent 100 commits reachable from HEAD. By default, entities,
+/// deps, and contents will only be extracted from the fist commit specified. The
+/// remaining commits are used to calculate changes. If this info is desired for
+/// more than the first commit, use the --structure argument.
+///
+/// Instead of providing the commits directly on the command line, Neodepends
+/// can also take commits as a text file. For example,
+/// 
+/// $ git rev-list HEAD -n 100 > commits.txt
+/// 
+/// $ neodepends --output=out.jsonl --format=jsonl --depends commits.txt
+/// 
+/// This is useful in some shells where subcommands are not available.
+/// 
+/// Dependency resolution can be done with Stack Graphs (--stackgraphs),
+/// Depends (--depends), or both. If both are enabled, Neodepends will
 /// determine which one to use for a particular language by using whichever one
-/// is specified first on the command-line. This is only relevant when a
-/// language is supported by both Stack Graphs and Depends.
+/// is specified first on the command-line. This is useful when a language is
+/// supported by both Stack Graphs and Depends.
+///
+/// If --format=csvs or --format=parquets, then a directory will be created with
+/// a .csv or .parquet file for each table requested. All other formats will
+/// result in a single file.
+///
+/// A design structure matrix (DSM) has a list of `variables` (entities) and a
+/// list of `cells` that indicate relations between pairs of variables. At
+/// minimum, these cells indicate syntactic dependencies between pairs of
+/// entities. Optionally, these cells may also indicate the number of times a
+/// pair of entities have changed together in the same commit (co-change).
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Opts {
-    #[clap(flatten, next_help_heading = "I/O Options")]
-    io_opts: IoOpts,
+    /// The path of the output file or directory.
+    #[arg(short, long)]
+    output: PathBuf,
 
-    #[clap(flatten, next_help_heading = "Logging Options")]
-    logging_opts: LoggingOpts,
+    /// Overwrite the output file or directory if it already exists.
+    ///
+    /// Careful! This will recursively delete everything at --output.
+    #[arg(short, long)]
+    force: bool,
 
-    #[clap(flatten, next_help_heading = "Depends Options")]
-    depends_opts: DependsOpts,
-
-    #[command(subcommand)]
-    command: SubCommandOpts,
-}
-
-impl Opts {
-    fn pathspec_opts(&self) -> &PathspecOpts {
-        match &self.command {
-            SubCommandOpts::Matrix(c) => &c.pathspec_opts,
-            SubCommandOpts::Tables(c) => &c.pathspec_opts,
-            SubCommandOpts::Dump(c) => &c.pathspec_opts,
-            SubCommandOpts::Entities(c) => &c.pathspec_opts,
-            SubCommandOpts::Deps(c) => &c.pathspec_opts,
-            SubCommandOpts::Changes(c) => &c.pathspec_opts,
-        }
-    }
-
-    fn file_level(&self) -> bool {
-        match &self.command {
-            SubCommandOpts::Matrix(c) => c.file_level(),
-            SubCommandOpts::Tables(c) => c.level_opts.file_level,
-            SubCommandOpts::Dump(c) => c.level_opts.file_level,
-            SubCommandOpts::Entities(c) => c.level_opts.file_level,
-            SubCommandOpts::Deps(c) => c.level_opts.file_level,
-            SubCommandOpts::Changes(c) => c.level_opts.file_level,
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-struct IoOpts {
     /// The root of the project/repository to scan.
     ///
     /// If not specified, will use the current working directory. If no git
     /// repository is found, then Neodepends is placed in "disk-only" mode
     /// and will read directly from the file system.
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     input: Option<PathBuf>,
 
-    /// The path of the output file.
-    ///
-    /// If not provided, will write to stdout.
-    #[arg(short, long, global = true)]
-    output: Option<PathBuf>,
+    /// Format of tabular output.
+    #[arg(long, value_parser = strum_parser!(OutputFormat))]
+    format: Option<OutputFormat>,
 
-    /// Overwrite the output file if it already exists.
-    #[arg(short, long, global = true)]
-    force: bool,
+    /// Extract and export the provided resources.
+    ///
+    /// If not provided, all supported resources will be exported.
+    #[arg(short, long, value_delimiter = ',', value_parser = strum_parser!(Resource))]
+    resources: Vec<Resource>,
+
+    /// Always report at the file-level, even when more fine-grain info is
+    /// available
+    #[arg(long)]
+    file_level: bool,
+
+    /// Scan these commits for structural data (entities, deps, and contents).
+    ///
+    /// If not provided, these will only be extracted from the first COMMIT
+    #[arg(long, value_name = "COMMIT")]
+    structure: Vec<String>,
+
+    /// Commits to be scanned for resources.
+    ///
+    /// Entities, deps, and contents will only be extracted from the first commit.
+    #[arg(value_name = "COMMIT")]
+    revspecs: Vec<String>,
+
+    #[clap(flatten)]
+    pathspec_opts: PathspecOpts,
+
+    #[clap(flatten, next_help_heading = "Dependency Options")]
+    resolver_opts: ResolverOpts,
+
+    #[clap(flatten, next_help_heading = "Depends Options")]
+    depends_opts: DependsOpts,
+
+    #[clap(flatten, next_help_heading = "Logging Options")]
+    logging_opts: LoggingOpts,
 }
 
-impl IoOpts {
-    fn input(&self) -> Result<PathBuf> {
-        Ok(self.input.clone().unwrap_or(std::env::current_dir()?))
-    }
-
-    fn prepare_output(&self) -> Result<()> {
-        if self.output.is_none() {
-            return Ok(());
-        }
-
-        let path = self.output.as_deref().unwrap();
-        let path_str = path.to_string_lossy();
-
-        if !path.exists() {
-            return Ok(());
-        }
-
-        match (path.is_file(), self.force) {
-            (true, true) => {
-                log::info!("Removing existing file at {}", &path_str);
-                std::fs::remove_file(path)?;
-            }
-            (true, false) => {
-                panic!("File already exists at {}. Use --force to overwrite it.", &path_str);
-            }
-            (false, true) => {
-                panic!(
-                    "Directory already exists at {}, but the --force flag can only overwrite \
-                     files. Please delete the directory before running neodepends.",
-                    &path_str
-                );
-            }
-            (false, false) => {
-                panic!(
-                    "Directory already exists at {}. Please delete the directory before running \
-                     neodepends.",
-                    &path_str
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn create_writer(&self) -> Result<Box<dyn Write>> {
-        match &self.output {
-            Some(path) => Ok(Box::new(File::create(path)?)),
-            None => Ok(Box::new(std::io::stdout())),
+impl Opts {
+    fn contains(&self, table: Resource) -> bool {
+        if self.resources.is_empty() {
+            true
+        } else {
+            self.resources.contains(&table)
         }
     }
 }
@@ -237,198 +230,6 @@ impl DependsOpts {
     }
 }
 
-#[derive(Debug, Subcommand)]
-enum SubCommandOpts {
-    Matrix(ExportMatrixOpts),
-    Tables(ExportTablesOpts),
-    Dump(DumpOpts),
-    Entities(ListEntitiesOpts),
-    Deps(ListDepsOpts),
-    Changes(ListChangesOpts),
-}
-
-/// Export project data as a design structure matrix.
-///
-/// A design structure matrix (DSM) has a list of `variables` (entities) and a
-/// list of `cells` that indicate relations between pairs of variables. At
-/// minimum, these cells indicate syntactic dependencies between pairs of
-/// entities. Optionally, these cells may also indicate the number of times a
-/// pair of entities have changed together in the same commit (co-change).
-///
-/// Any number of commits may be specified. If at least two are specified then
-/// the resulting matrix may also include co-change cells (if any co-changes are
-/// found). The fist commit will always be used to collect entities and
-/// syntactic dependencies. If there is no first commit, then entities and
-/// dependencies will be collected from WORKDIR.
-#[derive(Debug, Args)]
-struct ExportMatrixOpts {
-    /// Format of DSM output
-    ///
-    /// When --format=dsm-v1, --file-level is implied.
-    #[arg(long, default_value_t, value_parser = strum_parser!(MatrixFormat))]
-    format: MatrixFormat,
-
-    /// Commits to be scanned
-    #[arg(value_name = "COMMIT")]
-    revspecs: Vec<String>,
-
-    #[clap(flatten)]
-    pathspec_opts: PathspecOpts,
-
-    #[clap(flatten)]
-    level_opts: LevelOpts,
-
-    #[clap(flatten, next_help_heading = "Dependency Options")]
-    resolver_opts: ResolverOpts,
-}
-
-impl ExportMatrixOpts {
-    /// The option --format=dsm-v1 implies --file-level
-    fn file_level(&self) -> bool {
-        self.level_opts.file_level || self.format.is_dsm_v_1()
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(strum::Display, strum::EnumIs, strum::EnumString, strum::VariantNames)]
-#[strum(serialize_all = "kebab-case")]
-enum MatrixFormat {
-    DsmV1,
-    #[default]
-    DsmV2,
-}
-
-impl MatrixFormat {
-    pub fn to_matrix_str(&self, es: &[Entity], ds: &[EntityDep], cs: &[Change]) -> String {
-        match self {
-            MatrixFormat::DsmV1 => dsm_v1(es, ds, cs),
-            MatrixFormat::DsmV2 => dsm_v2(es, ds, cs),
-        }
-    }
-}
-
-/// Export project data as a collection of tables.
-///
-/// If --format=parquet or --format=csv, then a directory will be created at
-/// --output with a .parquet or .csv file for each table. If --format=sqlite,
-/// then a sqlite database file will be created at --output. In either case,
-/// --output must be specified. Tables cannot be exported through stdout.
-///
-/// Similar to the matrix subcommand, dependencies will only be extracted from
-/// the first commit specified. If there is no first commit, then entities and
-/// dependencies will be collected from WORKDIR.
-#[derive(Debug, Args)]
-struct ExportTablesOpts {
-    /// Format of tabular output
-    #[arg(long, default_value_t, value_parser = strum_parser!(TabularFormat))]
-    format: TabularFormat,
-
-    /// Only extract and export the provided tables
-    ///
-    /// Otherwise, all supported tables will be exported.
-    #[arg(short, long, value_delimiter = ',', value_parser = strum_parser!(Table))]
-    tables: Vec<Table>,
-
-    /// Commits to be scanned
-    #[arg(value_name = "COMMIT")]
-    revspecs: Vec<String>,
-
-    #[clap(flatten)]
-    pathspec_opts: PathspecOpts,
-
-    #[clap(flatten)]
-    level_opts: LevelOpts,
-
-    #[clap(flatten, next_help_heading = "Dependency Options")]
-    resolver_opts: ResolverOpts,
-}
-
-impl ExportTablesOpts {
-    fn contains(&self, table: &Table) -> bool {
-        if self.tables.is_empty() {
-            true
-        } else {
-            self.tables.contains(table)
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(strum::Display, strum::EnumIs, strum::EnumString, strum::VariantNames)]
-#[strum(serialize_all = "kebab-case")]
-enum TabularFormat {
-    Parquet,
-    Sqlite,
-    #[default]
-    Csv,
-}
-
-/// Export project data as a collection of tables
-#[derive(Debug, Args)]
-struct DumpOpts {
-    /// Commits to be scanned for structure (entities and deps)
-    #[arg(long, value_name = "COMMIT")]
-    structure: Vec<String>,
-
-    /// Commits to be scanned for history (changes)
-    #[arg(long, value_name = "COMMIT")]
-    history: Vec<String>,
-
-    #[clap(flatten)]
-    pathspec_opts: PathspecOpts,
-
-    #[clap(flatten)]
-    level_opts: LevelOpts,
-
-    #[clap(flatten, next_help_heading = "Dependency Options")]
-    resolver_opts: ResolverOpts,
-}
-
-/// Export entities as a table
-#[derive(Debug, Args)]
-struct ListEntitiesOpts {
-    /// Commits to be scanned
-    #[arg(value_name = "COMMIT")]
-    revspecs: Vec<String>,
-
-    #[clap(flatten)]
-    pathspec_opts: PathspecOpts,
-
-    #[clap(flatten)]
-    level_opts: LevelOpts,
-}
-
-/// Export deps as a table
-#[derive(Debug, Args)]
-struct ListDepsOpts {
-    #[clap(flatten, next_help_heading = "Dependency Options")]
-    resolver_opts: ResolverOpts,
-
-    /// Commits to be scanned
-    #[arg(value_name = "COMMIT")]
-    revspecs: Vec<String>,
-
-    #[clap(flatten)]
-    pathspec_opts: PathspecOpts,
-
-    #[clap(flatten)]
-    level_opts: LevelOpts,
-}
-
-/// Export changes as a table
-#[derive(Debug, Args)]
-struct ListChangesOpts {
-    /// Commits to be scanned
-    #[arg(value_name = "COMMIT")]
-    revspecs: Vec<String>,
-
-    #[clap(flatten)]
-    pathspec_opts: PathspecOpts,
-
-    #[clap(flatten)]
-    level_opts: LevelOpts,
-}
-
 #[derive(Debug, Args)]
 struct PathspecOpts {
     /// Only scan the provided languages
@@ -470,149 +271,94 @@ struct ResolverOpts {
     depends: bool,
 }
 
-#[derive(Debug, Args)]
-struct LevelOpts {
-    /// Always report at the file-level, even when more fine-grain info is
-    /// available
-    #[arg(long)]
-    file_level: bool,
-}
-
 fn main() -> Result<()> {
     let matches = Opts::command().get_matches();
     let opts = Opts::from_arg_matches(&matches)?;
-    let io_opts = &opts.io_opts;
-    let output_path = opts.io_opts.output.clone();
     env_logger::Builder::new().filter_level(opts.logging_opts.verbose.log_level_filter()).init();
-    let fs = FileSystem::open(opts.io_opts.input()?)?;
-    let pathspec = opts.pathspec_opts().pathspec()?;
-    let file_level = opts.file_level();
+    let fs = FileSystem::open(opts.input.clone().unwrap_or(std::env::current_dir()?))?;
+    let pathspec = opts.pathspec_opts.pathspec()?;
     let depends_config = opts.depends_opts.to_depends_config();
-    io_opts.prepare_output()?;
+    let mut extractor = Extractor::new(fs.clone(), opts.file_level);
+    extractor.set_resolver(create_resolver(&matches, depends_config));
 
-    let mut extractor = Extractor::new(fs.clone(), file_level);
-    let start = Instant::now();
+    // Parse commits
+    let mut structure_commits = try_parse_revspecs(&fs, &opts.structure)?;
+    let history_commits = try_parse_revspecs(&fs, &opts.revspecs)?;
 
-    match opts.command {
-        SubCommandOpts::Matrix(opts) => {
-            let mut writer = io_opts.create_writer()?;
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            ensure_nonempty(&commits)?;
-            let dep_commit = commits[0].clone();
-            let dep_filespec = Filespec::new(vec![dep_commit], pathspec.clone());
-            let change_filespec = Filespec::new(commits, pathspec);
-
-            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
-            extractor.set_resolver(resolver);
-
-            let entities = extractor.extract_entities(&dep_filespec);
-            let deps = extractor.extract_deps(&dep_filespec);
-            let changes = extractor.extract_changes(&change_filespec);
-            writer.write_all(opts.format.to_matrix_str(&entities, &deps, &changes).as_bytes())?;
+    if structure_commits.is_empty() {
+        if history_commits.is_empty() {
+            bail!("Must provide at least one commit (e.g. HEAD or WORKDIR)")
         }
-        SubCommandOpts::Tables(opts) => {
-            let output_path = output_path.expect("--output must be specified");
-
-            if !opts.format.is_csv() {
-                panic!("only csv output is currently supported")
-            }
-
-            let writer = CsvWriter::open(output_path)?;
-
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            ensure_nonempty(&commits)?;
-            let dep_commit = commits[0].clone();
-            let dep_filespec = Filespec::new(vec![dep_commit], pathspec.clone());
-            let change_filespec = Filespec::new(commits, pathspec);
-
-            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
-            extractor.set_resolver(resolver);
-
-            let mut content_ids = HashSet::new();
-
-            if opts.contains(&Table::Entities) {
-                log::info!("Extracting and writing entities table...");
-                let entities = extractor.extract_entities(&dep_filespec);
-                content_ids.extend(entities.iter().map(|e| e.content_id));
-                writer.write_entities(entities)?;
-            }
-
-            if opts.contains(&Table::Deps) {
-                log::info!("Extracting and writing deps table...");
-                let deps = extractor.extract_deps(&dep_filespec);
-                writer.write_deps(deps)?;
-            }
-
-            if opts.contains(&Table::Changes) {
-                log::info!("Extracting and writing changes table...");
-                let changes = extractor.extract_changes(&change_filespec);
-                writer.write_changes(changes)?;
-            }
-
-            if opts.contains(&Table::Contents) {
-                log::info!("Extracting and writing contents table...");
-                let contents =
-                    content_ids.into_iter().map(|id| Content::new(id, fs.read(id).unwrap()));
-                writer.write_contents(contents)?;
-            }
-        }
-        SubCommandOpts::Dump(opts) => {
-            let mut writer = io_opts.create_writer()?;
-            let dep_commits = try_parse_revspecs(&fs, &opts.structure)?;
-            let change_commits = try_parse_revspecs(&fs, &opts.history)?;
-            let dep_filespec = Filespec::new(dep_commits, pathspec.clone());
-            let change_filespec = Filespec::new(change_commits, pathspec);
-
-            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
-            extractor.set_resolver(resolver);
-
-            write_jsonl(&mut writer, &extractor.extract_entities(&dep_filespec));
-            write_jsonl(&mut writer, &extractor.extract_deps(&dep_filespec));
-            write_jsonl(&mut writer, &extractor.extract_changes(&change_filespec));
-        }
-        SubCommandOpts::Entities(opts) => {
-            let mut writer = io_opts.create_writer()?;
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            ensure_nonempty(&commits)?;
-            let filespec = Filespec::new(commits, pathspec);
-            write_jsonl(&mut writer, &extractor.extract_entities(&filespec));
-        }
-        SubCommandOpts::Deps(opts) => {
-            let mut writer = io_opts.create_writer()?;
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            ensure_nonempty(&commits)?;
-            let filespec = Filespec::new(commits, pathspec);
-
-            let resolver = create_resolver(&matches.subcommand().unwrap().1, depends_config);
-            extractor.set_resolver(resolver);
-
-            write_jsonl(&mut writer, &extractor.extract_deps(&filespec));
-        }
-        SubCommandOpts::Changes(opts) => {
-            let mut writer = io_opts.create_writer()?;
-            let commits = try_parse_revspecs(&fs, &opts.revspecs)?;
-            ensure_nonempty(&commits)?;
-            let filespec = Filespec::new(commits, pathspec);
-            write_jsonl(&mut writer, &extractor.extract_changes(&filespec));
-        }
+        structure_commits.push(history_commits[0].clone());
     }
 
+    let output_path = opts.output.clone();
+    let mut writer = opts.format.unwrap().open(output_path)?;
+
+    if structure_commits.len() > 1 && writer.is_single_structure() {
+        bail!("Selected output format can only take the structural information of a single commit")
+    }
+
+    let structure_filespec = Filespec::new(structure_commits, pathspec.clone());
+    let history_filespec = Filespec::new(history_commits, pathspec);
+    prepare_output(&opts.output, opts.force);
+    let start = Instant::now();
+
+    let should_extract = |resource: Resource| writer.supports(resource) && opts.contains(resource);
+
+    if should_extract(Resource::Entities) {
+        log::info!("Extracting and writing entities...");
+        extractor.extract_entities(&structure_filespec).for_each(|v| {
+            writer.write_entity(v).unwrap();
+        });
+    }
+
+    if should_extract(Resource::Deps) {
+        log::info!("Extracting and writing deps...");
+        extractor.extract_deps(&structure_filespec).for_each(|v| {
+            writer.write_dep(v).unwrap();
+        });
+    }
+
+    if should_extract(Resource::Changes) {
+        log::info!("Extracting and writing changes...");
+        extractor.extract_changes(&history_filespec).for_each(|v| {
+            writer.write_change(v).unwrap();
+        });
+    }
+
+    if should_extract(Resource::Contents) {
+        log::info!("Extracting and writing contents...");
+        extractor.extract_contents(&structure_filespec).for_each(|v| {
+            writer.write_content(v).unwrap();
+        });
+    }
+
+    writer.finalize()?;
     log::info!("Finished in {}ms", start.elapsed().as_millis());
     Ok(())
 }
 
-fn write_jsonl<W: Write, T: serde::Serialize>(mut writer: W, elements: &[T]) {
-    for element in elements {
-        serde_json::to_writer(&mut writer, element).unwrap()
-    }
-}
+fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
+    let path = output.as_ref();
+    let path_str = path.to_string_lossy();
 
-fn ensure_nonempty(ids: &[PseudoCommitId]) -> Result<()> {
-    if ids.is_empty() {
-        bail!("must provide at least one commit (e.g. HEAD or WORKDIR)");
-    } else {
-        Ok(())
+    if !path.exists() {
+        return;
     }
+
+    if !force {
+        panic!("Output path ({}) already exists. Use --force to overwrite it.", &path_str);
+    }
+
+    if path.is_file() {
+        log::info!("Removing existing file at {}", &path_str);
+        std::fs::remove_file(path).expect("failed to remove file");
+        return;
+    }
+
+    log::info!("Removing existing directory at {}", &path_str);
+    std::fs::remove_dir_all(path).expect("failed to remove directory");
 }
 
 fn try_parse_revspecs(fs: &FileSystem, revspecs: &[String]) -> Result<Vec<PseudoCommitId>> {
