@@ -9,6 +9,8 @@ use std::path::Path;
 use anyhow::bail;
 use anyhow::Result;
 use itertools::Itertools;
+use rusqlite::types::ToSqlOutput;
+use rusqlite::ToSql;
 use sha1::Digest;
 use sha1::Sha1;
 
@@ -80,6 +82,12 @@ impl Debug for Sha1Hash {
     }
 }
 
+impl ToSql for Sha1Hash {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
 /// The ID of a commit as identified by git.
 ///
 /// Internally, git calculates this as a SHA-1 hash.
@@ -105,6 +113,12 @@ impl From<CommitId> for git2::Oid {
     }
 }
 
+impl ToSql for CommitId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
 /// Might refer to an actual commit or may refer to the project directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(strum::EnumIs, strum::EnumTryAs)]
@@ -121,6 +135,15 @@ impl serde::Serialize for PseudoCommitId {
         match self {
             PseudoCommitId::CommitId(commit_id) => commit_id.0.serialize(serializer),
             PseudoCommitId::WorkDir => serializer.serialize_str("WORKDIR"),
+        }
+    }
+}
+
+impl ToSql for PseudoCommitId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            PseudoCommitId::CommitId(c) => c.to_sql(),
+            PseudoCommitId::WorkDir => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Null)),
         }
     }
 }
@@ -151,6 +174,12 @@ impl From<git2::Oid> for ContentId {
 impl From<ContentId> for git2::Oid {
     fn from(value: ContentId) -> Self {
         value.0.into()
+    }
+}
+
+impl ToSql for ContentId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
     }
 }
 
@@ -452,6 +481,12 @@ pub enum EntityKind {
     Record,
 }
 
+impl ToSql for EntityKind {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.as_ref().to_sql()
+    }
+}
+
 /// A "simpler" [EntityId] that is only calculated from `parent_id`, `name`, and
 /// `kind`.
 ///
@@ -470,6 +505,12 @@ impl SimpleEntityId {
         bytes.extend(name.as_bytes());
         bytes.extend(kind.as_ref().as_bytes());
         Self(Sha1Hash::hash(&bytes))
+    }
+}
+
+impl ToSql for SimpleEntityId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
     }
 }
 
@@ -505,6 +546,12 @@ impl EntityId {
         bytes.extend(content_id.0.as_ref());
         bytes.extend(simple_id.0.as_ref());
         Self(Sha1Hash::hash(&bytes))
+    }
+}
+
+impl ToSql for EntityId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
     }
 }
 
@@ -581,6 +628,12 @@ pub enum DepKind {
     Set,
     Throw,
     Use,
+}
+
+impl ToSql for DepKind {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.as_ref().to_sql()
+    }
 }
 
 /// A syntactic dependency between two files.
@@ -679,6 +732,12 @@ pub enum ChangeKind {
     Added,
     Deleted,
     Modified,
+}
+
+impl ToSql for ChangeKind {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.as_ref().to_sql()
+    }
 }
 
 /// A record of an [Entity] being touched by a commit.

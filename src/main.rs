@@ -79,7 +79,7 @@ macro_rules! strum_parser {
 ///
 /// Entities, deps, and contents and considered "structural" resources, while
 /// changes are considered "historical" resources.
-/// 
+///
 /// For examples,
 ///
 /// $ neodepends --output=out.jsonl --format=jsonl --depends WORKDIR
@@ -97,13 +97,13 @@ macro_rules! strum_parser {
 ///
 /// Instead of providing the commits directly on the command line, Neodepends
 /// can also take commits as a text file. For example,
-/// 
+///
 /// $ git rev-list HEAD -n 100 > commits.txt
-/// 
+///
 /// $ neodepends --output=out.jsonl --format=jsonl --depends commits.txt
-/// 
+///
 /// This is useful in some shells where subcommands are not available.
-/// 
+///
 /// Dependency resolution can be done with Stack Graphs (--stackgraphs),
 /// Depends (--depends), or both. If both are enabled, Neodepends will
 /// determine which one to use for a particular language by using whichever one
@@ -141,7 +141,7 @@ struct Opts {
     input: Option<PathBuf>,
 
     /// Format of tabular output.
-    /// 
+    ///
     /// If not specified, will try to infer from the file extension of the output.
     #[arg(long, value_parser = strum_parser!(OutputFormat))]
     format: Option<OutputFormat>,
@@ -344,11 +344,16 @@ fn main() -> Result<()> {
 }
 
 fn infer_format<P: AsRef<Path>>(output: P) -> Result<OutputFormat> {
-    output.as_ref().extension().and_then(|e| match e.to_ascii_lowercase().to_str() {
-        Some("json") => Some(OutputFormat::DsmV2),
-        Some("jsonl") => Some(OutputFormat::Jsonl),
-        _ => None
-    }).context("Could not infer file format. Use --format to specify.")
+    output
+        .as_ref()
+        .extension()
+        .and_then(|e| match e.to_ascii_lowercase().to_str() {
+            Some("db") => Some(OutputFormat::Sqlite),
+            Some("json") => Some(OutputFormat::DsmV2),
+            Some("jsonl") => Some(OutputFormat::Jsonl),
+            _ => None,
+        })
+        .context("Could not infer file format. Use --format to specify.")
 }
 
 fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
@@ -356,6 +361,9 @@ fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
     let path_str = path.to_string_lossy();
 
     if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("failed to create parent directory");
+        }
         return;
     }
 
@@ -366,6 +374,20 @@ fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
     if path.is_file() {
         log::info!("Removing existing file at {}", &path_str);
         std::fs::remove_file(path).expect("failed to remove file");
+
+        // Kind of hacky but we need to remove the WAL of a SQLite database if it exists
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        let db_shm = path.with_file_name(format!("{}-shm", filename));
+        let db_wal = path.with_file_name(format!("{}-wal", filename));
+
+        if db_shm.exists() {
+            std::fs::remove_file(db_shm).expect("failed to remove shared-memory file");
+        }
+
+        if db_wal.exists() {
+            std::fs::remove_file(db_wal).expect("failed to remove write-ahead log");
+        }
+
         return;
     }
 

@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Result;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::params;
 
 use crate::core::Change;
 use crate::core::Content;
@@ -36,6 +39,7 @@ pub enum Resource {
 pub enum OutputFormat {
     Csvs,
     Jsonl,
+    Sqlite,
     DsmV1,
     DsmV2,
 }
@@ -45,6 +49,7 @@ impl OutputFormat {
         Ok(match self {
             OutputFormat::Csvs => Box::new(CsvsWriter::open(path)?),
             OutputFormat::Jsonl => Box::new(JsonlWriter::open(path)?),
+            OutputFormat::Sqlite => Box::new(SqliteWriter::open(path)?),
             OutputFormat::DsmV1 => Box::new(DsmWriter::open(path, Dsm::V1)?),
             OutputFormat::DsmV2 => Box::new(DsmWriter::open(path, Dsm::V2)?),
         })
@@ -70,7 +75,7 @@ struct CsvsWriter {
 }
 
 impl CsvsWriter {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<CsvsWriter> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         std::fs::create_dir_all(path.as_ref())?;
         let entities = Mutex::new(csv::Writer::from_path(path.as_ref().join("entities.csv"))?);
         let deps = Mutex::new(csv::Writer::from_path(path.as_ref().join("deps.csv"))?);
@@ -120,7 +125,7 @@ struct JsonlWriter {
 }
 
 impl JsonlWriter {
-    fn open<P: AsRef<Path>>(path: P) -> Result<JsonlWriter> {
+    fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self { file: Mutex::new(LineWriter::new(File::create(path)?)) })
     }
 
@@ -175,7 +180,7 @@ struct DsmWriter {
 }
 
 impl DsmWriter {
-    fn open<P: AsRef<Path>>(path: P, dsm: Dsm) -> Result<DsmWriter> {
+    fn open<P: AsRef<Path>>(path: P, dsm: Dsm) -> Result<Self> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             dsm,
@@ -234,6 +239,130 @@ impl Writer for DsmWriter {
 }
 
 #[derive(Debug)]
+struct SqliteWriter {
+    pool: Pool<SqliteConnectionManager>,
+}
+
+impl SqliteWriter {
+    fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let manager = SqliteConnectionManager::file(path);
+        let pool = Pool::new(manager)?;
+        pool.get()?.execute_batch(SQLITE_INIT)?;
+        Ok(Self { pool })
+    }
+}
+
+impl Writer for SqliteWriter {
+    fn supports(&self, _: Resource) -> bool {
+        true
+    }
+
+    fn is_single_structure(&self) -> bool {
+        false
+    }
+
+    fn write_entity(&self, value: Entity) -> Result<()> {
+        let value = EntityRow::from(value);
+
+        self.pool.get()?.execute(
+            "INSERT INTO entities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                &value.id,
+                &value.parent_id,
+                &value.name,
+                &value.kind,
+                &value.start_byte,
+                &value.start_row,
+                &value.start_column,
+                &value.end_byte,
+                &value.end_row,
+                &value.end_column,
+                &value.content_id,
+                &value.simple_id,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn write_dep(&self, value: EntityDep) -> Result<()> {
+        let value = EntityDepRow::from(value);
+
+        self.pool.get()?.execute(
+            "INSERT INTO deps VALUES (?, ?, ?, ?, ?)",
+            params![&value.src, &value.tgt, &value.kind, &value.row, &value.commit_id],
+        )?;
+
+        Ok(())
+    }
+
+    fn write_change(&self, value: Change) -> Result<()> {
+        self.pool.get()?.execute(
+            "INSERT INTO changes VALUES (?, ?, ?, ?, ?)",
+            params![&value.simple_id, &value.commit_id, &value.kind, &value.adds, &value.dels],
+        )?;
+
+        Ok(())
+    }
+
+    fn write_content(&self, value: Content) -> Result<()> {
+        self.pool
+            .get()?
+            .execute("INSERT INTO contents VALUES (?, ?)", params![&value.id, &value.content])?;
+
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        self.pool.get()?.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+}
+
+const SQLITE_INIT: &'static str = "
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA wal_checkpoint(TRUNCATE);
+
+    CREATE TABLE IF NOT EXISTS entities (
+        id BLOB NOT NULL PRIMARY KEY,
+        parent_id BLOB REFERENCES entities (id),
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        start_byte INT NOT NULL,
+        start_row INT NOT NULL,
+        start_column INT NOT NULL,
+        end_byte INT NOT NULL,
+        end_row INT NOT NULL,
+        end_column INT NOT NULL,
+        content_id BLOB NOT NULL,
+        simple_id BLOB NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS deps (
+        src BLOB NOT NULL,
+        tgt BLOB NOT NULL,
+        kind TEXT NOT NULL,
+        row INT NOT NULL,
+        commit_id BLOB
+    );
+
+    CREATE TABLE IF NOT EXISTS changes (
+        simple_id BLOB NOT NULL,
+        commit_id BLOB NOT NULL,
+        kind TEXT NOT NULL,
+        adds INT NOT NULL,
+        dels INT NOT NULL,
+        PRIMARY KEY (simple_id, commit_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS contents (
+        content_id BLOB NOT NULL PRIMARY KEY,
+        content TEXT NOT NULL
+    );
+";
+
+#[derive(Debug)]
 #[derive(serde::Serialize)]
 struct EntityRow {
     id: EntityId,
@@ -275,9 +404,7 @@ struct EntityDepRow {
     src: EntityId,
     tgt: EntityId,
     kind: DepKind,
-    byte: Option<usize>,
     row: usize,
-    column: Option<usize>,
     commit_id: PseudoCommitId,
 }
 
@@ -287,9 +414,7 @@ impl EntityDepRow {
             src: entity_dep.src,
             tgt: entity_dep.tgt,
             kind: entity_dep.kind,
-            byte: entity_dep.position.byte(),
             row: entity_dep.position.row(),
-            column: entity_dep.position.column(),
             commit_id: entity_dep.commit_id,
         }
     }
