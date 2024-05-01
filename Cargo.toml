@@ -1,6 +1,6 @@
 [package]
 name = "neodepends"
-version = "0.0.3"
+version = "0.0.4"
 description = "Quickly extract entities, dependencies, and changes from a software project"
 homepage = "https://github.com/jlefever/neodepends"
 repository = "https://github.com/jlefever/neodepends"
