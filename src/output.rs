@@ -6,9 +6,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
+use rusqlite::Connection;
 
 use crate::core::Change;
 use crate::core::Content;
@@ -240,15 +239,14 @@ impl Writer for DsmWriter {
 
 #[derive(Debug)]
 struct SqliteWriter {
-    pool: Pool<SqliteConnectionManager>,
+    conn: Mutex<Connection>,
 }
 
 impl SqliteWriter {
     fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(path);
-        let pool = Pool::new(manager)?;
-        pool.get()?.execute_batch(SQLITE_INIT)?;
-        Ok(Self { pool })
+        let conn = Connection::open(path)?;
+        conn.execute_batch(SQLITE_INIT)?;
+        Ok(Self { conn: Mutex::new(conn) })
     }
 }
 
@@ -264,9 +262,11 @@ impl Writer for SqliteWriter {
     fn write_entity(&self, value: Entity) -> Result<()> {
         let value = EntityRow::from(value);
 
-        self.pool.get()?.execute(
-            "INSERT INTO entities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare_cached("INSERT INTO entities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
+            .execute(params![
                 &value.id,
                 &value.parent_id,
                 &value.name,
@@ -279,8 +279,7 @@ impl Writer for SqliteWriter {
                 &value.end_column,
                 &value.content_id,
                 &value.simple_id,
-            ],
-        )?;
+            ])?;
 
         Ok(())
     }
@@ -288,33 +287,44 @@ impl Writer for SqliteWriter {
     fn write_dep(&self, value: EntityDep) -> Result<()> {
         let value = EntityDepRow::from(value);
 
-        self.pool.get()?.execute(
-            "INSERT INTO deps VALUES (?, ?, ?, ?, ?)",
-            params![&value.src, &value.tgt, &value.kind, &value.row, &value.commit_id],
-        )?;
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare_cached("INSERT INTO deps VALUES (?, ?, ?, ?, ?)")?
+            .execute(params![&value.src, &value.tgt, &value.kind, &value.row, &value.commit_id])?;
 
         Ok(())
     }
 
     fn write_change(&self, value: Change) -> Result<()> {
-        self.pool.get()?.execute(
-            "INSERT INTO changes VALUES (?, ?, ?, ?, ?)",
-            params![&value.simple_id, &value.commit_id, &value.kind, &value.adds, &value.dels],
-        )?;
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare_cached("INSERT INTO changes VALUES (?, ?, ?, ?, ?)")?
+            .execute(params![
+                &value.simple_id,
+                &value.commit_id,
+                &value.kind,
+                &value.adds,
+                &value.dels
+            ])?;
 
         Ok(())
     }
 
     fn write_content(&self, value: Content) -> Result<()> {
-        self.pool
-            .get()?
-            .execute("INSERT INTO contents VALUES (?, ?)", params![&value.id, &value.content])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .prepare_cached("INSERT INTO contents VALUES (?, ?)")?
+            .execute(params![&value.id, &value.content])?;
 
         Ok(())
     }
 
     fn finalize(&mut self) -> Result<()> {
-        self.pool.get()?.execute_batch("VACUUM;")?;
+        self.conn.lock().unwrap().execute_batch("VACUUM;")?;
+
         Ok(())
     }
 }
@@ -326,7 +336,7 @@ const SQLITE_INIT: &'static str = "
 
     CREATE TABLE IF NOT EXISTS entities (
         id BLOB NOT NULL PRIMARY KEY,
-        parent_id BLOB REFERENCES entities (id),
+        parent_id BLOB,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
         start_byte INT NOT NULL,
