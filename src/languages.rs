@@ -1,26 +1,11 @@
-use core::panic;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use tree_sitter::Language;
-use tree_sitter_c::language as c_language;
-use tree_sitter_cpp::language as cpp_language;
-use tree_sitter_go::language as go_language;
-use tree_sitter_java::language as java_language;
-use tree_sitter_javascript::language as js_language;
-use tree_sitter_kotlin::language as kt_language;
-use tree_sitter_python::language as py_language;
-use tree_sitter_ruby::language as rb_language;
 use tree_sitter_stack_graphs::StackGraphLanguage;
-use tree_sitter_typescript::language_typescript as ts_language;
 
 use crate::spec::Pathspec;
 use crate::tagging::Tagger;
@@ -81,11 +66,11 @@ impl Lang {
             Lang::Cpp => &CPP,
             Lang::Go => &GO,
             Lang::Java => &JAVA,
-            Lang::JavaScript => &JS,
-            Lang::Kotlin => &KT,
-            Lang::Python => &PY,
-            Lang::Ruby => &RB,
-            Lang::TypeScript => &TS,
+            Lang::JavaScript => &JAVASCRIPT,
+            Lang::Kotlin => &KOTLIN,
+            Lang::Python => &PYTHON,
+            Lang::Ruby => &RUBY,
+            Lang::TypeScript => &TYPESCRIPT,
         }
     }
 }
@@ -99,30 +84,15 @@ struct LangConfig {
 
 impl LangConfig {
     fn new(
-        name: &'static str,
         language: Language,
         pathspec: Pathspec,
+        tag_query: Option<&str>,
+        tsg: Option<&str>,
         depends_lang: Option<&'static str>,
     ) -> Self {
-        let path = PathBuf::from_str(&format!("../languages/{}", name)).unwrap();
-        let tagger = Tagger::new(Some(language), try_read(path.join("tags.scm")).as_deref());
-        let sgl = try_read(path.join("stack-graphs.tsg"))
-            .map(|x| Arc::new(StackGraphLanguage::from_str(language, &x).unwrap()));
+        let tagger = Tagger::new(Some(language), tag_query);
+        let sgl = tsg.map(|x| Arc::new(StackGraphLanguage::from_str(language, &x).unwrap()));
         Self { pathspec, tagger, sgl, depends_lang }
-    }
-}
-
-fn try_read<P: AsRef<Path>>(path: P) -> Option<String> {
-    match File::open(path) {
-        Ok(mut file) => {
-            let mut buf = String::new();
-            file.read_to_string(&mut buf).unwrap();
-            Some(buf)
-        }
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => None,
-            _ => panic!(),
-        },
     }
 }
 
@@ -201,22 +171,67 @@ lazy_static! {
         table.insert_special_file(Lang::TypeScript, "tsconfig.json");
         table
     };
-    static ref C: LangConfig =
-        LangConfig::new("c", c_language(), LANG_TABLE.pathspec(Lang::C), Some("cpp"));
-    static ref CPP: LangConfig =
-        LangConfig::new("cpp", cpp_language(), LANG_TABLE.pathspec(Lang::Cpp), Some("cpp"));
-    static ref GO: LangConfig =
-        LangConfig::new("go", go_language(), LANG_TABLE.pathspec(Lang::Go), Some("go"));
-    static ref JAVA: LangConfig =
-        LangConfig::new("java", java_language(), LANG_TABLE.pathspec(Lang::Java), Some("java"));
-    static ref JS: LangConfig =
-        LangConfig::new("javascript", js_language(), LANG_TABLE.pathspec(Lang::JavaScript), None);
-    static ref KT: LangConfig =
-        LangConfig::new("kotlin", kt_language(), LANG_TABLE.pathspec(Lang::Kotlin), Some("kotlin"));
-    static ref PY: LangConfig =
-        LangConfig::new("python", py_language(), LANG_TABLE.pathspec(Lang::Python), Some("python"));
-    static ref RB: LangConfig =
-        LangConfig::new("ruby", rb_language(), LANG_TABLE.pathspec(Lang::Ruby), Some("ruby"));
-    static ref TS: LangConfig =
-        LangConfig::new("typescript", ts_language(), LANG_TABLE.pathspec(Lang::TypeScript), None);
+    static ref C: LangConfig = LangConfig::new(
+        tree_sitter_c::language(),
+        LANG_TABLE.pathspec(Lang::C),
+        None,
+        None,
+        Some("cpp")
+    );
+    static ref CPP: LangConfig = LangConfig::new(
+        tree_sitter_cpp::language(),
+        LANG_TABLE.pathspec(Lang::Cpp),
+        None,
+        None,
+        Some("cpp")
+    );
+    static ref GO: LangConfig = LangConfig::new(
+        tree_sitter_go::language(),
+        LANG_TABLE.pathspec(Lang::Go),
+        None,
+        None,
+        Some("go")
+    );
+    static ref JAVA: LangConfig = LangConfig::new(
+        tree_sitter_java::language(),
+        LANG_TABLE.pathspec(Lang::Java),
+        Some(include_str!("../languages/java/tags.scm")),
+        Some(include_str!("../languages/java/stack-graphs.tsg")),
+        Some("java")
+    );
+    static ref JAVASCRIPT: LangConfig = LangConfig::new(
+        tree_sitter_javascript::language(),
+        LANG_TABLE.pathspec(Lang::JavaScript),
+        None,
+        Some(include_str!("../languages/javascript/stack-graphs.tsg")),
+        None
+    );
+    static ref KOTLIN: LangConfig = LangConfig::new(
+        tree_sitter_kotlin::language(),
+        LANG_TABLE.pathspec(Lang::Kotlin),
+        None,
+        None,
+        Some("kotlin")
+    );
+    static ref PYTHON: LangConfig = LangConfig::new(
+        tree_sitter_python::language(),
+        LANG_TABLE.pathspec(Lang::Python),
+        None,
+        Some(include_str!("../languages/python/stack-graphs.tsg")),
+        Some("python")
+    );
+    static ref RUBY: LangConfig = LangConfig::new(
+        tree_sitter_ruby::language(),
+        LANG_TABLE.pathspec(Lang::Ruby),
+        None,
+        Some(include_str!("../languages/ruby/stack-graphs.tsg")),
+        Some("ruby")
+    );
+    static ref TYPESCRIPT: LangConfig = LangConfig::new(
+        tree_sitter_typescript::language_typescript(),
+        LANG_TABLE.pathspec(Lang::TypeScript),
+        None,
+        Some(include_str!("../languages/typescript/stack-graphs.tsg")),
+        None
+    );
 }
