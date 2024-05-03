@@ -142,7 +142,8 @@ struct Opts {
 
     /// Format of tabular output.
     ///
-    /// If not specified, will try to infer from the file extension of the output.
+    /// If not specified, will try to infer from the file extension of the
+    /// output. If --format=dsm-v1, then --file-level is implied.
     #[arg(long, value_parser = strum_parser!(OutputFormat))]
     format: Option<OutputFormat>,
 
@@ -153,7 +154,9 @@ struct Opts {
     resources: Vec<Resource>,
 
     /// Always report at the file-level, even when more fine-grain info is
-    /// available
+    /// available.
+    ///
+    /// Implied if --format=dsm-v1.
     #[arg(long)]
     file_level: bool,
 
@@ -280,7 +283,18 @@ fn main() -> Result<()> {
     let fs = FileSystem::open(opts.input.clone().unwrap_or(std::env::current_dir()?))?;
     let pathspec = opts.pathspec_opts.pathspec()?;
     let depends_config = opts.depends_opts.to_depends_config();
-    let mut extractor = Extractor::new(fs.clone(), opts.file_level);
+
+    let format = match opts.format {
+        Some(format) => format,
+        None => infer_format(&opts.output)?,
+    };
+
+    let file_level = match format {
+        OutputFormat::DsmV1 => true,
+        _ => opts.file_level,
+    };
+
+    let mut extractor = Extractor::new(fs.clone(), file_level);
     extractor.set_resolver(create_resolver(&matches, depends_config));
 
     let mut structure_commits = try_parse_revspecs(&fs, &opts.structure)?;
@@ -294,11 +308,7 @@ fn main() -> Result<()> {
     }
 
     prepare_output(&opts.output, opts.force);
-    let output_path = opts.output.clone();
-    let mut writer = match opts.format {
-        Some(format) => format.open(output_path)?,
-        None => infer_format(&output_path)?.open(output_path)?,
-    };
+    let mut writer = format.open(&opts.output)?;
 
     if structure_commits.len() > 1 && writer.is_single_structure() {
         bail!("Selected output format can only take the structural information of a single commit")
