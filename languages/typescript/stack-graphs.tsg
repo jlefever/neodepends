@@ -2666,7 +2666,16 @@ if none @is_async {
   (ternary_expression)
   (this)
   (true)
+
   (type_assertion)
+
+
+
+
+
+
+
+
   (unary_expression)
   (undefined)
   (update_expression)
@@ -2804,6 +2813,15 @@ if none @is_async {
   (decorator (call_expression function:(member_expression object:(identifier)@name)))
   (decorator (call_expression function:(member_expression object:(member_expression object:(identifier)@name))))
   (decorator (call_expression function:(member_expression object:(member_expression object:(member_expression object:(identifier)@name)))))
+
+
+
+
+
+
+
+
+
 ] {
 if none @is_def {
   node @name.cotype
@@ -2851,6 +2869,12 @@ if none @is_def {
   (decorator (call_expression function:(member_expression object:(identifier)@name)))
   (decorator (call_expression function:(member_expression object:(member_expression object:(identifier)@name))))
   (decorator (call_expression function:(member_expression object:(member_expression object:(member_expression object:(identifier)@name)))))
+
+
+
+
+
+
 ] {
 if none @is_def {
   node @name.expr_ref
@@ -3523,10 +3547,22 @@ if none @is_async {
 ; (member_expression (identifier) (property_identifier))
 ; (subscript_expression (identifier) (string))
 
-(member_expression
-  object: (_)@object
-  property: (_)@prop
-)@member_expr {
+[
+  (member_expression
+    object: (_)@object
+    property: (_)@prop
+  )@member_expr
+
+
+
+
+
+
+
+
+
+
+ ] {
   node @member_expr.member
   node @prop.expr_ref
   node @prop.expr_ref__typeof
@@ -6159,3 +6195,138 @@ if none @is_acc {
   attr (@async.async_type__promise_ref__ns) push_symbol = "%T"
   edge @async.async_type__promise_ref__ns -> @async.lexical_scope
 }
+
+;
+;       #  #####  #     #
+;       # #     #  #   #
+;       # #         # #
+;       #  #####     #
+; #     #       #   # #
+; #     # #     #  #   #
+;  #####   #####  #     #
+;
+; ;;;;;;;;;;;;;;;;;;;;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+; ;;;;;;;;;;;;;;;;;;;;
+
