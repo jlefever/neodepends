@@ -250,12 +250,13 @@ fn walk_dir<P: AsRef<Path>>(root: P, pathspec: &Pathspec) -> Result<Vec<FileKey>
     for entry in WalkDir::new(root.as_ref()).follow_links(true) {
         match entry {
             Ok(entry) => {
-                let path = entry.path().strip_prefix(root.as_ref())?;
+                let abs_path = entry.path();
+                let rel_path = entry.path().strip_prefix(root.as_ref())?;
 
-                if path.is_file() && pathspec.matches(&path) {
-                    let content_id = ContentId::from_path(&path);
-                    let filename = path.to_string_lossy().to_string();
-                    keys.push(FileKey::new(filename, content_id));
+                if abs_path.is_file() && pathspec.matches(&rel_path) {
+                    let content_id = git2::Oid::hash_file(git2::ObjectType::Blob, abs_path).unwrap();
+                    let filename = rel_path.to_string_lossy().to_string();
+                    keys.push(FileKey::new(filename, content_id.into()));
                 }
             }
             Err(err) => {

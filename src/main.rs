@@ -193,6 +193,18 @@ impl Opts {
             self.resources.contains(&table)
         }
     }
+
+    fn absolute_input(&self) -> PathBuf {
+        if let Some(input) = self.input.clone() {
+            if input.is_absolute() {
+                input
+            } else {
+                std::env::current_dir().unwrap().join(input)
+            }
+        } else {
+            std::env::current_dir().unwrap()
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -280,7 +292,7 @@ fn main() -> Result<()> {
     let matches = Opts::command().get_matches();
     let opts = Opts::from_arg_matches(&matches)?;
     env_logger::Builder::new().filter_level(opts.logging_opts.verbose.log_level_filter()).init();
-    let fs = FileSystem::open(opts.input.clone().unwrap_or(std::env::current_dir()?))?;
+    let fs = FileSystem::open(opts.absolute_input())?;
     let pathspec = opts.pathspec_opts.pathspec()?;
     let depends_config = opts.depends_opts.to_depends_config();
 
@@ -302,12 +314,13 @@ fn main() -> Result<()> {
 
     if structure_commits.is_empty() {
         if history_commits.is_empty() {
-            bail!("Must provide at least one commit (e.g. HEAD or WORKDIR)")
+            structure_commits.push(PseudoCommitId::WorkDir);
+        } else {
+            structure_commits.push(history_commits[0].clone());
         }
-        structure_commits.push(history_commits[0].clone());
     }
 
-    prepare_output(&opts.output, opts.force);
+    prepare_output(&opts.output, opts.force)?;
     let mut writer = format.open(&opts.output)?;
 
     if structure_commits.len() > 1 && writer.is_single_structure() {
@@ -366,24 +379,24 @@ fn infer_format<P: AsRef<Path>>(output: P) -> Result<OutputFormat> {
         .context("Could not infer file format. Use --format to specify.")
 }
 
-fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
+fn prepare_output<P: AsRef<Path>>(output: P, force: bool) -> Result<()> {
     let path = output.as_ref();
     let path_str = path.to_string_lossy();
 
     if !path.exists() {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("failed to create parent directory");
+            std::fs::create_dir_all(parent).context("failed to create parent directory")?;
         }
-        return;
+        return Ok(());
     }
 
     if !force {
-        panic!("Output path ({}) already exists. Use --force to overwrite it.", &path_str);
+        bail!("Output path ({}) already exists. Use --force to overwrite it.", &path_str);
     }
 
     if path.is_file() {
         log::info!("Removing existing file at {}", &path_str);
-        std::fs::remove_file(path).expect("failed to remove file");
+        std::fs::remove_file(path).context("failed to remove file")?;
 
         // Kind of hacky but we need to remove the WAL of a SQLite database if it exists
         let filename = path.file_name().unwrap().to_str().unwrap();
@@ -391,18 +404,19 @@ fn prepare_output<P: AsRef<Path>>(output: P, force: bool) {
         let db_wal = path.with_file_name(format!("{}-wal", filename));
 
         if db_shm.exists() {
-            std::fs::remove_file(db_shm).expect("failed to remove shared-memory file");
+            std::fs::remove_file(db_shm).context("failed to remove shared-memory file")?;
         }
 
         if db_wal.exists() {
-            std::fs::remove_file(db_wal).expect("failed to remove write-ahead log");
+            std::fs::remove_file(db_wal).context("failed to remove write-ahead log")?;
         }
 
-        return;
+        return Ok(());
     }
 
     log::info!("Removing existing directory at {}", &path_str);
-    std::fs::remove_dir_all(path).expect("failed to remove directory");
+    std::fs::remove_dir_all(path).context("failed to remove directory")?;
+    return Ok(())
 }
 
 fn try_parse_revspecs(fs: &FileSystem, revspecs: &[String]) -> Result<Vec<PseudoCommitId>> {

@@ -156,10 +156,6 @@ impl ToSql for PseudoCommitId {
 pub struct ContentId(pub Sha1Hash);
 
 impl ContentId {
-    pub fn from_path<P: AsRef<Path>>(path: P) -> ContentId {
-        git2::Oid::hash_file(git2::ObjectType::Blob, path).unwrap().into()
-    }
-
     pub fn from_content(content: &str) -> ContentId {
         git2::Oid::hash_object(git2::ObjectType::Blob, content.as_bytes()).unwrap().into()
     }
