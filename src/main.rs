@@ -168,7 +168,9 @@ struct Opts {
 
     /// Commits to be scanned for resources.
     ///
-    /// Entities, deps, and contents will only be extracted from the first commit.
+    /// Defaults to WORKDIR if not specified. If input is a bare repository,
+    /// then it will default to HEAD. Entities, deps, and contents will only be
+    /// extracted from the first commit.
     #[arg(value_name = "COMMIT")]
     revspecs: Vec<String>,
 
@@ -314,7 +316,11 @@ fn main() -> Result<()> {
 
     if structure_commits.is_empty() {
         if history_commits.is_empty() {
-            structure_commits.push(PseudoCommitId::WorkDir);
+            if fs.is_bare_repo() {
+                structure_commits.push(fs.head());
+            } else {
+                structure_commits.push(PseudoCommitId::WorkDir)
+            }
         } else {
             structure_commits.push(history_commits[0].clone());
         }

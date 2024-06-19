@@ -53,6 +53,25 @@ impl FileSystem {
         Ok(Self { disk: Disk::open(root)?, repo })
     }
 
+    /// Does this project lack a git repository?
+    #[allow(dead_code)]
+    pub fn is_disk_only(&self) -> bool {
+        self.repo.is_none()
+    }
+
+    /// Is this a bare repository?
+    pub fn is_bare_repo(&self) -> bool {
+        self.repo.as_ref().map_or(false, |r| r.is_bare())
+    }
+
+    /// The HEAD commit if a git repository, otherwise WORKDIR.
+    pub fn head(&self) -> PseudoCommitId {
+        match &self.repo {
+            Some(repo) => PseudoCommitId::CommitId(repo.head()),
+            None => PseudoCommitId::WorkDir,
+        }
+    }
+
     /// Attempt to parse a revspec as a [PseudoCommitId].
     ///
     /// This revspec must refer to a single commit, not a range.
@@ -176,6 +195,16 @@ impl Repository {
     /// Root of repository (without .git).
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Is this a bare repository?
+    fn is_bare(&self) -> bool {
+        self.repo.lock().unwrap().is_bare()
+    }
+
+    /// Get the [CommitId] for the HEAD commit.
+    fn head(&self) -> CommitId {
+        self.repo.lock().unwrap().head().unwrap().peel_to_commit().unwrap().id().into()
     }
 
     /// Collect all [FileKey]s that are reachable from the given commit and
