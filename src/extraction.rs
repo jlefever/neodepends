@@ -7,6 +7,7 @@ use itertools::Itertools;
 use rayon::prelude::*;
 
 use crate::core::Change;
+use crate::core::ChangeKind;
 use crate::core::Content;
 use crate::core::Diff;
 use crate::core::Entity;
@@ -86,8 +87,6 @@ impl Extractor {
 }
 
 fn calc_changes(entity_sets: &HashMap<FileKey, EntitySet>, diff: &Diff) -> Vec<Change> {
-    let change_kind = diff.change_kind();
-
     let old_entity_set = diff.old.as_ref().map(|k| entity_sets.get(&k).unwrap());
     let new_entity_set = diff.new.as_ref().map(|k| entity_sets.get(&k).unwrap());
 
@@ -98,10 +97,27 @@ fn calc_changes(entity_sets: &HashMap<FileKey, EntitySet>, diff: &Diff) -> Vec<C
     ids.extend(old_ids.iter().flat_map(|x| x.keys()));
     ids.extend(new_ids.iter().flat_map(|x| x.keys()));
 
+    let change_kinds: HashMap<SimpleEntityId, ChangeKind> = ids
+        .iter()
+        .map(|id| {
+            let in_old = old_ids.as_ref().map_or(false, |old_ids| old_ids.contains_key(id));
+            let in_new = new_ids.as_ref().map_or(false, |new_ids| new_ids.contains_key(id));
+            let kind = match (in_old, in_new) {
+                (false, false) => panic!(),
+                (false, true) => ChangeKind::Added,
+                (true, false) => ChangeKind::Deleted,
+                (true, true) => ChangeKind::Modified,
+            };
+            (*id, kind)
+        })
+        .collect();
+
     let old_counts: Counter<SimpleEntityId> = old_ids.into_iter().flatten().collect();
     let new_counts: Counter<SimpleEntityId> = new_ids.into_iter().flatten().collect();
 
     ids.iter()
-        .map(|id| Change::new(*id, diff.commit_id, change_kind, old_counts[id], new_counts[id]))
+        .map(|id| {
+            Change::new(*id, diff.commit_id, change_kinds[id], old_counts[id], new_counts[id])
+        })
         .collect()
 }

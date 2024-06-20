@@ -305,8 +305,8 @@ impl Writer for SqliteWriter {
                 &value.simple_id,
                 &value.commit_id,
                 &value.kind,
+                &value.dels,
                 &value.adds,
-                &value.dels
             ])?;
 
         Ok(())
@@ -361,8 +361,8 @@ const SQLITE_INIT: &'static str = "
         simple_id BLOB NOT NULL,
         commit_id BLOB NOT NULL,
         kind TEXT NOT NULL,
-        adds INT NOT NULL,
         dels INT NOT NULL,
+        adds INT NOT NULL,
         PRIMARY KEY (simple_id, commit_id)
     );
 
