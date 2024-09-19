@@ -89,16 +89,17 @@ impl LocationTable {
         let mut bytes = SparseVec::with_capacity(entities.len());
         let mut rows = SparseVec::with_capacity(entities.len());
 
-        for Entity { id, parent_id, location, .. } in entities {
-            ids.push(*id);
+        for entity in entities {
+            ids.push(entity.id);
+            let location = entity.location();
 
             // TODO: Ensure the file location calculation is correct so this isn't necessary
-            if parent_id.is_none() {
-                bytes.insert_many(usize::MIN, usize::MAX, *id);
-                rows.insert_many(usize::MIN, usize::MAX, *id);
+            if entity.parent_id.is_none() {
+                bytes.insert_many(usize::MIN, usize::MAX, entity.id);
+                rows.insert_many(usize::MIN, usize::MAX, entity.id);
             } else {
-                bytes.insert_many(location.start.byte, location.end.byte, *id);
-                rows.insert_many(location.start.row, location.end.row, *id);
+                bytes.insert_many(location.start.byte, location.end.byte, entity.id);
+                rows.insert_many(location.start.row, location.end.row, entity.id);
             }
         }
 
@@ -154,13 +155,15 @@ pub struct EntityTagger {
     language: Language,
     query: Query,
     kinds: Vec<Option<EntityKind>>,
-    name: u32,
+    ix_name: u32,
+    ix_comment: Option<u32>,
 }
 
 impl EntityTagger {
     fn new(language: Language, tag_query: &str) -> Self {
         let query = Query::new(language, tag_query).unwrap();
-        let name = query.capture_index_for_name("name").unwrap();
+        let ix_name = query.capture_index_for_name("name").unwrap();
+        let ix_comment = query.capture_index_for_name("comment");
 
         let kinds = query
             .capture_names()
@@ -168,7 +171,7 @@ impl EntityTagger {
             .map(|c| c.strip_prefix("tag.").map(|k| EntityKind::try_from(k).unwrap()))
             .collect::<Vec<_>>();
 
-        Self { language, query, kinds, name }
+        Self { language, query, kinds, ix_name, ix_comment }
     }
 
     fn tag(&self, filename: &str, content: &str) -> Result<EntitySet> {
@@ -184,15 +187,18 @@ impl EntityTagger {
 
         for r#match in cursor.matches(&self.query, root, content.as_bytes()) {
             let mut builder: CaptureBuilder = CaptureBuilder::default();
+            builder.comment(None);
 
             for capture in r#match.captures {
-                if capture.index == self.name {
+                if capture.index == self.ix_name {
                     builder.name(capture.node.utf8_text(content.as_bytes()).unwrap().to_string());
+                } else if Some(capture.index) == self.ix_comment {
+                    builder.comment(Some(Span::from_ts(capture.node.range())));
                 } else if let Some(kind) = self.kinds[capture.index as usize] {
                     builder.id(CaptureId(capture.node.id()));
                     builder.ancestor_ids(collect_ancestor_ids(&capture.node));
                     builder.kind(kind);
-                    builder.location(Span::from_ts(capture.node.range()));
+                    builder.code(Span::from_ts(capture.node.range()));
                 }
             }
 
@@ -213,7 +219,8 @@ struct Capture {
     ancestor_ids: Vec<CaptureId>,
     name: String,
     kind: EntityKind,
-    location: Span,
+    code: Span,
+    comment: Option<Span>,
 }
 
 impl Capture {
@@ -223,7 +230,8 @@ impl Capture {
             ancestor_ids: vec![],
             name: filename.to_string(),
             kind: EntityKind::File,
-            location: Span::new(Position::new(0, 0, 0), end_position),
+            code: Span::new(Position::new(0, 0, 0), end_position),
+            comment: None,
         }
     }
 
@@ -233,7 +241,8 @@ impl Capture {
             ancestor_ids: vec![],
             name: filename.to_string(),
             kind: EntityKind::File,
-            location: root.range().into(),
+            code: root.range().into(),
+            comment: None,
         }
     }
 
@@ -248,7 +257,7 @@ impl Capture {
     }
 
     fn topo_key(&self) -> (usize, Span, String, EntityKind) {
-        (self.ancestor_ids.len(), self.location, self.name.clone(), self.kind)
+        (self.ancestor_ids.len(), self.code, self.name.clone(), self.kind)
     }
 }
 
@@ -298,7 +307,8 @@ fn into_entity_set(captures: HashMap<CaptureId, Capture>, content_id: ContentId)
             parent_entity_id,
             capture.name,
             capture.kind,
-            capture.location,
+            capture.code,
+            capture.comment,
             content_id,
             simple_id,
         );

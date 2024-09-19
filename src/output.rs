@@ -391,17 +391,18 @@ struct EntityRow {
 
 impl EntityRow {
     fn from(entity: Entity) -> Self {
+        let location = entity.location();
         Self {
             id: entity.id,
             parent_id: entity.parent_id,
             name: entity.name,
             kind: entity.kind,
-            start_byte: entity.location.start.byte,
-            start_row: entity.location.start.row,
-            start_column: entity.location.start.column,
-            end_byte: entity.location.end.byte,
-            end_row: entity.location.end.row,
-            end_column: entity.location.end.column,
+            start_byte: location.start.byte,
+            start_row: location.start.row,
+            start_column: location.start.column,
+            end_byte: location.end.byte,
+            end_row: location.end.row,
+            end_column: location.end.column,
             content_id: entity.content_id,
             simple_id: entity.simple_id,
         }

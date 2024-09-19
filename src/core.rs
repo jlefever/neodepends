@@ -313,6 +313,14 @@ impl Span {
         Self { start, end }
     }
 
+    pub fn union(&self, span: &Span) -> Span {
+        Span { start: self.start.min(span.start), end: self.end.max(span.end) }
+    }
+
+    pub fn intersection(&self, span: &Span) -> Span {
+        Span { start: self.start.max(span.start), end: self.end.min(span.end) }
+    }
+
     pub fn from_ts(value: tree_sitter::Range) -> Self {
         value.into()
     }
@@ -520,7 +528,8 @@ impl EntityId {
         parent_id: Option<EntityId>,
         name: &str,
         kind: EntityKind,
-        location: Span,
+        code: Span,
+        comment: Option<Span>,
         content_id: ContentId,
         simple_id: SimpleEntityId,
     ) -> Self {
@@ -533,12 +542,21 @@ impl EntityId {
             unsafe { std::mem::transmute(u32::try_from(num).unwrap().to_be()) }
         }
 
-        bytes.extend(to_bytes(location.start.byte));
-        bytes.extend(to_bytes(location.start.row));
-        bytes.extend(to_bytes(location.start.column));
-        bytes.extend(to_bytes(location.end.byte));
-        bytes.extend(to_bytes(location.end.row));
-        bytes.extend(to_bytes(location.end.column));
+        let mut append_span = |span: &Span| {
+            bytes.extend(to_bytes(span.start.byte));
+            bytes.extend(to_bytes(span.start.row));
+            bytes.extend(to_bytes(span.start.column));
+            bytes.extend(to_bytes(span.end.byte));
+            bytes.extend(to_bytes(span.end.row));
+            bytes.extend(to_bytes(span.end.column));
+        };
+
+        append_span(&code);
+
+        if let Some(comment) = comment {
+            append_span(&comment);
+        }
+
         bytes.extend(content_id.0.as_ref());
         bytes.extend(simple_id.0.as_ref());
         Self(Sha1Hash::hash(&bytes))
@@ -564,7 +582,8 @@ pub struct Entity {
     pub parent_id: Option<EntityId>,
     pub name: String,
     pub kind: EntityKind,
-    pub location: Span,
+    pub code: Span,
+    pub comment: Option<Span>,
     pub content_id: ContentId,
     pub simple_id: SimpleEntityId,
 }
@@ -574,12 +593,21 @@ impl Entity {
         parent_id: Option<EntityId>,
         name: String,
         kind: EntityKind,
-        location: Span,
+        code: Span,
+        comment: Option<Span>,
         content_id: ContentId,
         simple_id: SimpleEntityId,
     ) -> Self {
-        let id = EntityId::new(parent_id, &name, kind, location, content_id, simple_id);
-        Self { id, parent_id, name, kind, location, content_id, simple_id }
+        let id = EntityId::new(parent_id, &name, kind, code, comment, content_id, simple_id);
+        Self { id, parent_id, name, kind, code, comment, content_id, simple_id }
+    }
+
+    pub fn location(&self) -> Span {
+        if let Some(comment) = self.comment {
+            self.code.union(&comment)
+        } else {
+            self.code
+        }
     }
 }
 
