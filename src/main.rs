@@ -153,6 +153,10 @@ struct Opts {
     #[arg(short, long, value_delimiter = ',', value_parser = strum_parser!(Resource))]
     resources: Vec<Resource>,
 
+    /// Extract entities from historical commits in addition to structural.
+    #[arg(long)]
+    all_entities: bool,
+
     /// Always report at the file-level, even when more fine-grain info is
     /// available.
     ///
@@ -333,6 +337,9 @@ fn main() -> Result<()> {
         bail!("Selected output format can only take the structural information of a single commit")
     }
 
+    let mut union_commits = structure_commits.clone();
+    union_commits.extend(history_commits.clone());
+    let union_filespec = Filespec::new(union_commits, pathspec.clone());
     let structure_filespec = Filespec::new(structure_commits, pathspec.clone());
     let history_filespec = Filespec::new(history_commits, pathspec);
     let start = Instant::now();
@@ -341,7 +348,11 @@ fn main() -> Result<()> {
 
     if should_extract(Resource::Entities) {
         log::info!("Extracting and writing entities...");
-        extractor.extract_entities(&structure_filespec).for_each(|v| {
+        let filespec = match opts.all_entities {
+            true => &union_filespec,
+            false => &structure_filespec,
+        };
+        extractor.extract_entities(filespec).for_each(|v| {
             writer.write_entity(v).unwrap();
         });
     }
@@ -422,7 +433,7 @@ fn prepare_output<P: AsRef<Path>>(output: P, force: bool) -> Result<()> {
 
     log::info!("Removing existing directory at {}", &path_str);
     std::fs::remove_dir_all(path).context("failed to remove directory")?;
-    return Ok(())
+    Ok(())
 }
 
 fn try_parse_revspecs(fs: &FileSystem, revspecs: &[String]) -> Result<Vec<PseudoCommitId>> {
