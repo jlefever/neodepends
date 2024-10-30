@@ -175,9 +175,9 @@ struct Repository {
 }
 
 impl Repository {
-    /// Attempt to open a Repository at or above `path`.
+    /// Attempt to open a Repository at `path`.
     fn open<P: AsRef<Path>>(path: P) -> Result<Repository> {
-        let repo = git2::Repository::discover(path)?;
+        let repo = git2::Repository::open(path)?;
 
         // This is a necessary config for Windows
         repo.config().unwrap().set_bool("core.longpaths", true).unwrap();
