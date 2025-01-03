@@ -367,7 +367,7 @@ const SQLITE_INIT: &'static str = "
     );
 
     CREATE TABLE IF NOT EXISTS contents (
-        content_id BLOB NOT NULL PRIMARY KEY,
+        id BLOB NOT NULL PRIMARY KEY,
         content TEXT NOT NULL
     );
 ";
