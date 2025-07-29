@@ -265,7 +265,10 @@ impl Writer for SqliteWriter {
         self.conn
             .lock()
             .unwrap()
-            .prepare_cached("INSERT INTO entities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
+            .prepare_cached(
+                "INSERT INTO entities VALUES
+                 (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?
             .execute(params![
                 &value.id,
                 &value.parent_id,
@@ -277,6 +280,12 @@ impl Writer for SqliteWriter {
                 &value.end_byte,
                 &value.end_row,
                 &value.end_column,
+                &value.comment_start_byte,
+                &value.comment_start_row,
+                &value.comment_start_column,
+                &value.comment_end_byte,
+                &value.comment_end_row,
+                &value.comment_end_column,
                 &value.content_id,
                 &value.simple_id,
             ])?;
@@ -345,6 +354,12 @@ const SQLITE_INIT: &'static str = "
         end_byte INT NOT NULL,
         end_row INT NOT NULL,
         end_column INT NOT NULL,
+        comment_start_byte INT,
+        comment_start_row INT,
+        comment_start_column INT,
+        comment_end_byte INT,
+        comment_end_row INT,
+        comment_end_column INT,
         content_id BLOB NOT NULL,
         simple_id BLOB NOT NULL
     );
@@ -385,24 +400,38 @@ struct EntityRow {
     end_byte: usize,
     end_row: usize,
     end_column: usize,
+    comment_start_byte: Option<usize>,
+    comment_start_row: Option<usize>,
+    comment_start_column: Option<usize>,
+    comment_end_byte: Option<usize>,
+    comment_end_row: Option<usize>,
+    comment_end_column: Option<usize>,
     content_id: ContentId,
     simple_id: SimpleEntityId,
 }
 
 impl EntityRow {
     fn from(entity: Entity) -> Self {
-        let location = entity.location();
         Self {
             id: entity.id,
             parent_id: entity.parent_id,
             name: entity.name,
             kind: entity.kind,
-            start_byte: location.start.byte,
-            start_row: location.start.row,
-            start_column: location.start.column,
-            end_byte: location.end.byte,
-            end_row: location.end.row,
-            end_column: location.end.column,
+
+            start_byte: entity.code.start.byte,
+            start_row: entity.code.start.row,
+            start_column: entity.code.start.column,
+            end_byte: entity.code.end.byte,
+            end_row: entity.code.end.row,
+            end_column: entity.code.end.column,
+
+            comment_start_byte: entity.comment.map(|c| c.start.byte),
+            comment_start_row: entity.comment.map(|c| c.start.row),
+            comment_start_column: entity.comment.map(|c| c.start.column),
+            comment_end_byte: entity.comment.map(|c| c.end.byte),
+            comment_end_row: entity.comment.map(|c| c.end.row),
+            comment_end_column: entity.comment.map(|c| c.end.column),
+
             content_id: entity.content_id,
             simple_id: entity.simple_id,
         }
