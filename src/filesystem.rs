@@ -284,7 +284,7 @@ fn walk_dir<P: AsRef<Path>>(root: P, pathspec: &Pathspec) -> Result<Vec<FileKey>
 
                 if abs_path.is_file() && pathspec.matches(&rel_path) {
                     let content_id = git2::Oid::hash_file(git2::ObjectType::Blob, abs_path).unwrap();
-                    let filename = rel_path.to_string_lossy().to_string();
+                    let filename = rel_path.components().map(|c| c.as_os_str().to_string_lossy()).join("/");
                     keys.push(FileKey::new(filename, content_id.into()));
                 }
             }
