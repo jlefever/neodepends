@@ -483,6 +483,8 @@ pub enum EntityKind {
     Interface,
     Method,
     Record,
+    Decorator,
+    Function,
 }
 
 impl ToSql for EntityKind {
