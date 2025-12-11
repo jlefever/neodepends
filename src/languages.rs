@@ -216,7 +216,7 @@ lazy_static! {
     static ref PYTHON: LangConfig = LangConfig::new(
         tree_sitter_python::language(),
         LANG_TABLE.pathspec(Lang::Python),
-        None,
+        Some(include_str!("../languages/python/tags.scm")),
         Some(include_str!("../languages/python/stack-graphs.tsg")),
         Some("python")
     );
