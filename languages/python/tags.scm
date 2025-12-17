@@ -64,35 +64,47 @@
   )
 )
 
-; Fields/Variables assigned in __init__
-; Tree-sitter wrap the assignment matching in expression_state in case
-; that's the only thing happening in the body
+; Fields matching, use conditional to match both the single statement and multi statements cases
+; only match for attributes of a class initiated in "__init__"
 (
   (class_definition
     body: (block
       (function_definition
         name: (identifier) @func_name
         body: (block
-          (expression_statement
+          [
+            (expression_statement
+              (assignment
+                left: (attribute
+                  object: (identifier) @self_ref
+                  attribute: (identifier) @name))) @tag.Field
             (assignment
               left: (attribute
                 object: (identifier) @self_ref
-                attribute: (identifier) @name)))) @tag.Field)))
+                attribute: (identifier) @name)) @tag.Field
+          ]))))
   (#eq? @func_name "__init__")
   (#eq? @self_ref "self")
 )
 
-; we don't wrap the match in expression_statement in case there are multiple logics
+; Like the above but for case like self.x += 3 instead of self.x = 3
 (
   (class_definition
     body: (block
       (function_definition
         name: (identifier) @func_name
         body: (block
-          (assignment
-            left: (attribute
-              object: (identifier) @self_ref
-              attribute: (identifier) @name))) @tag.Field)))
+          [
+            (expression_statement
+              (augmented_assignment
+                left: (attribute
+                  object: (identifier) @self_ref
+                  attribute: (identifier) @name))) @tag.Field
+            (augmented_assignment
+              left: (attribute
+                object: (identifier) @self_ref
+                attribute: (identifier) @name)) @tag.Field
+          ]))))
   (#eq? @func_name "__init__")
   (#eq? @self_ref "self")
 )
