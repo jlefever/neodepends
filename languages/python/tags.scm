@@ -1,18 +1,7 @@
 ; Class definitions
 (
-  (comment)? @comment
-  .
   (class_definition
     name: (identifier) @name) @tag.Class
-)
-
-; Decorated class definitions
-(
-  (comment)? @comment
-  .
-  (decorated_definition
-    (class_definition
-      name: (identifier) @name)) @tag.Class
 )
 
 ; Method definitions (functions inside classes, including __init__)
@@ -66,16 +55,6 @@
   )
 )
 
-; Module-level function definitions with comment
-(
-  (module
-    (comment)? @comment
-    .
-    (function_definition
-      name: (identifier) @name) @tag.Function
-  )
-)
-
 ; Decorated function definitions at module level
 (
   (module
@@ -85,13 +64,18 @@
   )
 )
 
-; Decorated function definitions at module level with comment
+; Fields/Variables assigned in __init__
 (
-  (module
-    (comment)? @comment
-    .
-    (decorated_definition
+  (class_definition
+    body: (block
       (function_definition
-        name: (identifier) @name)) @tag.Function
-  )
+        name: (identifier) @func_name
+        body: (block
+          (expression_statement
+            (assignment
+              left: (attribute
+                object: (identifier) @self_ref
+                attribute: (identifier) @name)))) @tag.Field)))
+  (#eq? @func_name "__init__")
+  (#eq? @self_ref "self")
 )
