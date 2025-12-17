@@ -65,6 +65,8 @@
 )
 
 ; Fields/Variables assigned in __init__
+; Tree-sitter wrap the assignment matching in expression_state in case
+; that's the only thing happening in the body
 (
   (class_definition
     body: (block
@@ -76,6 +78,21 @@
               left: (attribute
                 object: (identifier) @self_ref
                 attribute: (identifier) @name)))) @tag.Field)))
+  (#eq? @func_name "__init__")
+  (#eq? @self_ref "self")
+)
+
+; we don't wrap the match in expression_statement in case there are multiple logics
+(
+  (class_definition
+    body: (block
+      (function_definition
+        name: (identifier) @func_name
+        body: (block
+          (assignment
+            left: (attribute
+              object: (identifier) @self_ref
+              attribute: (identifier) @name))) @tag.Field)))
   (#eq? @func_name "__init__")
   (#eq? @self_ref "self")
 )
